@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BiliScribe · B站字幕本地提取</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%23FB7299'/%3E%3Cpath d='M5 7h14v9H5z' fill='%23fff'/%3E%3Cpath d='M9.2 11.3l2.3 2.3 2.8-3.2' fill='none' stroke='%23FB7299' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --pink:#FB7299; --pink-d:#FF8FB0; --pink-deep:#E5487E; --cyan:#23ADE5;
+    --ink:#E8EAF0; --sub:#9AA1B2; --line:#2A2C38;
+    --bg:#13141B; --card:#1C1D26; --input:#171821; --green:#34D399;
+    --amber:#FBBF24; --red:#F87171;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:
+      radial-gradient(1000px 420px at 85% -10%,rgba(251,114,153,.14),transparent 60%),
+      radial-gradient(900px 420px at 5% -6%,rgba(35,173,229,.10),transparent 55%),
+      var(--bg);
+    background-attachment:fixed;
+    color:var(--ink);min-height:100vh;overflow-x:hidden;
+    font-family:'PingFang SC','Microsoft YaHei','Segoe UI',Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;line-height:1.6;}
+  .canvas{max-width:1176px;margin:0 auto;padding:0 48px 48px;}
+
+  /* 顶栏 */
+  .topbar{display:flex;align-items:center;justify-content:space-between;height:76px;
+    border-bottom:1px solid var(--line);gap:12px;}
+  .brand{display:flex;align-items:center;gap:13px;min-width:0;}
+  .logo{width:44px;height:44px;border-radius:12px;flex:none;
+    background:linear-gradient(135deg,#FF8FB0,#FB7299 55%,#E0487C);
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 8px 22px rgba(251,114,153,.3);}
+  .logo svg{width:24px;height:24px;}
+  .brand h1{font-size:20px;font-weight:700;letter-spacing:.3px;white-space:nowrap;}
+  .brand .sub{font-size:12px;color:var(--sub);margin-top:1px;}
+  .top-right{display:flex;align-items:center;gap:12px;flex:none;}
+  .pill{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;
+    padding:7px 14px;border-radius:999px;background:rgba(52,211,153,.12);color:var(--green);
+    border:1px solid rgba(52,211,153,.28);white-space:nowrap;}
+  .pill .d{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);}
+  .pill.warn{background:rgba(251,191,36,.12);color:var(--amber);border-color:rgba(251,191,36,.3);}
+  .pill.warn .d{background:var(--amber);box-shadow:0 0 8px var(--amber);}
+  .acct-chip{display:flex;align-items:center;gap:10px;background:var(--card);
+    border:1px solid var(--line);border-radius:999px;padding:6px 14px 6px 7px;
+    cursor:pointer;font-family:inherit;color:var(--ink);}
+  .acct-chip:hover{border-color:var(--pink);}
+  .acct-chip .av{width:32px;height:32px;border-radius:50%;
+    background:linear-gradient(135deg,#2E8FC4,#1E6E9C);color:#fff;font-size:14px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;border:2px solid rgba(35,173,229,.35);}
+  .acct-chip .nm{font-size:13px;font-weight:600;line-height:1.25;text-align:left;}
+  .acct-chip .nm small{display:block;font-size:10.5px;color:var(--sub);font-weight:400;}
+  .login-top{display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:#fff;
+    background:linear-gradient(135deg,#FB7299,#E5487E);border:none;border-radius:999px;padding:10px 18px;
+    font-family:inherit;cursor:pointer;box-shadow:0 8px 20px rgba(251,114,153,.3);}
+  .login-top svg{width:15px;height:15px;}
+  .ver{font-size:12px;color:var(--sub);white-space:nowrap;}
+
+  .main{max-width:1080px;margin:0 auto;padding-top:30px;}
+  .page-title{font-size:22px;font-weight:700;margin-bottom:5px;}
+  .page-desc{font-size:13px;color:var(--sub);margin-bottom:20px;}
+
+  .card{background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,0)),var(--card);
+    border:1px solid var(--line);border-radius:18px;box-shadow:0 10px 34px rgba(0,0,0,.3);
+    margin-bottom:20px;}
+  .card .bd{padding:22px 24px;}
+  .card .hd{padding:20px 24px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  .card .hd h2{font-size:16px;font-weight:700;}
+  .hd-ico{width:26px;height:26px;border-radius:8px;background:rgba(251,114,153,.16);
+    display:flex;align-items:center;justify-content:center;}
+  .hd-ico svg{width:15px;height:15px;}
+
+  /* 输入 */
+  .input-wrap{position:relative;border:1.5px solid var(--line);border-radius:14px;background:var(--input);
+    transition:.15s;}
+  .input-wrap:focus-within{border-color:var(--pink);box-shadow:0 0 0 4px rgba(251,114,153,.13);}
+  textarea{width:100%;border:none;background:transparent;resize:vertical;outline:none;color:var(--ink);
+    font-family:inherit;font-size:14px;line-height:1.7;padding:14px 16px 42px;min-height:132px;}
+  textarea::placeholder{color:#6B7280;}
+  .input-foot{position:absolute;left:12px;right:12px;bottom:9px;display:flex;
+    justify-content:space-between;align-items:center;}
+  .chip-mini{font-size:12px;color:var(--cyan);background:rgba(35,173,229,.1);
+    border:1px solid rgba(35,173,229,.3);border-radius:7px;padding:3px 9px;cursor:pointer;font-family:inherit;}
+  .cnt{font-size:11.5px;color:#5C6373;}
+
+  .opt-label{font-size:12.5px;font-weight:600;color:var(--sub);margin:20px 0 9px;}
+  .fmts{display:flex;gap:9px;flex-wrap:wrap;}
+  .tag{border:1.5px solid var(--line);background:var(--input);border-radius:10px;
+    padding:9px 16px;font-size:13.5px;font-weight:600;color:#A6ADB8;cursor:pointer;
+    font-family:inherit;display:flex;align-items:center;gap:7px;transition:.12s;}
+  .tag .tick{width:15px;height:15px;border-radius:50%;border:1.5px solid #3A3D4B;
+    display:flex;align-items:center;justify-content:center;}
+  .tag .tick svg{width:9px;height:9px;display:none;}
+  .tag.on{border-color:var(--pink);background:rgba(251,114,153,.12);color:var(--pink-d);}
+  .tag.on .tick{background:var(--pink);border-color:var(--pink);}
+  .tag.on .tick svg{display:block;}
+  .tag small{font-weight:400;color:#6B7280;font-size:11px;}
+  .tag.on small{color:#E89AB2;}
+
+  .opts{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:4px;}
+  .opt-field{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  .opt-field input[type=text]{width:130px;border:1.5px solid var(--line);border-radius:9px;
+    padding:9px 11px;font-size:13px;font-family:inherit;background:var(--input);color:var(--ink);outline:none;}
+  .opt-field input[type=text]:focus{border-color:var(--pink);}
+  .opt-field .hint{font-size:11.5px;color:#6B7280;}
+  .seg{display:flex;border:1.5px solid var(--line);border-radius:9px;overflow:hidden;width:fit-content;}
+  .seg span{padding:9px 17px;font-size:13px;cursor:pointer;color:#A6ADB8;background:var(--input);
+    user-select:none;}
+  .seg span.on{background:linear-gradient(135deg,#FB7299,#E5487E);color:#fff;font-weight:600;}
+
+  .actions{display:flex;gap:12px;margin-top:22px;}
+  .btn{display:flex;align-items:center;justify-content:center;gap:8px;border:none;
+    border-radius:12px;font-size:15px;font-weight:600;font-family:inherit;cursor:pointer;}
+  .btn svg{width:17px;height:17px;}
+  .btn-go{flex:1;padding:14px;background:linear-gradient(135deg,#FB7299,#E5487E);color:#fff;
+    box-shadow:0 10px 24px rgba(251,114,153,.3);}
+  .btn-go:disabled{opacity:.55;cursor:not-allowed;box-shadow:none;}
+  .btn-folder{width:54px;height:48px;border-radius:12px;border:1px solid var(--line);
+    background:var(--input);cursor:pointer;display:flex;align-items:center;justify-content:center;}
+  .btn-folder:hover{border-color:var(--cyan);}
+  .btn-folder svg{width:21px;height:21px;}
+
+  .run-box{margin-top:20px;background:var(--input);border-radius:13px;padding:14px 16px;
+    border:1px solid var(--line);display:none;}
+  .prow{display:flex;justify-content:space-between;font-size:12.5px;color:var(--sub);margin-bottom:9px;gap:10px;}
+  .prow b{color:var(--ink);}
+  .queued-tag{color:var(--amber);font-weight:600;}
+  .bar{height:8px;border-radius:99px;background:#262833;overflow:hidden;}
+  .bar i{display:block;height:100%;width:0;border-radius:99px;
+    background:linear-gradient(90deg,#FF9EBD,#FB7299);box-shadow:0 0 10px rgba(251,114,153,.5);
+    transition:width .3s;}
+  pre.log{margin-top:12px;background:#0E0F15;border:1px solid #23252E;border-radius:10px;
+    padding:12px 14px;font-size:12px;color:#B9C0D0;font-family:Consolas,'Courier New',monospace;
+    max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all;}
+
+  /* 结果 */
+  .ok-badge{font-size:11.5px;font-weight:600;color:var(--green);
+    background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.28);padding:3px 11px;border-radius:999px;}
+  .warn-badge{font-size:11.5px;font-weight:600;color:var(--amber);
+    background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.3);padding:3px 11px;border-radius:999px;}
+  .err-badge{font-size:11.5px;font-weight:600;color:var(--red);
+    background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.3);padding:3px 11px;border-radius:999px;}
+  .video{border:1px solid var(--line);border-radius:13px;overflow:hidden;margin:16px 0 12px;}
+  .video-hd{display:flex;align-items:center;gap:13px;padding:13px 16px;background:var(--input);
+    border-bottom:1px solid var(--line);}
+  .thumb{width:64px;height:40px;border-radius:8px;flex:none;overflow:hidden;position:relative;
+    background:linear-gradient(135deg,#2A2C38,#0E0F14);}
+  .thumb::after{content:"";position:absolute;inset:0;
+    background:radial-gradient(circle at 70% 30%,rgba(251,114,153,.6),transparent 60%);}
+  .thumb img{width:100%;height:100%;object-fit:cover;position:relative;z-index:1;}
+  .vt{flex:1;min-width:0;}
+  .vt .t{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .vt .m{font-size:11.5px;color:var(--sub);margin-top:3px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .file-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:10px;
+    padding:13px 16px 16px;min-width:0;}
+  .file{display:flex;flex-direction:column;gap:8px;border:1px solid var(--line);border-radius:10px;
+    padding:12px 13px;background:var(--card);text-decoration:none;color:var(--ink);transition:.12s;
+    min-width:0;}
+  .file:hover{border-color:var(--pink);background:#22232E;box-shadow:0 6px 16px rgba(251,114,153,.14);}
+  .file .ft{font-size:10.5px;font-weight:700;letter-spacing:.5px;width:fit-content;
+    padding:2px 7px;border-radius:5px;color:#fff;}
+  .ft.srt{background:#FB7299;} .ft.vtt{background:#23ADE5;} .ft.txt{background:#6B7280;}
+  .ft.json{background:#D98706;} .ft.md{background:#7E72E6;}
+  .file .fn{font-size:11.5px;color:#B6BCC9;line-height:1.45;width:100%;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .file .dl{font-size:11px;color:var(--pink-d);font-weight:600;display:flex;align-items:center;gap:4px;}
+  .file .dl svg{width:12px;height:12px;}
+  .sub-msg{padding:0 16px 14px;font-size:12.5px;color:var(--sub);}
+  .sub-msg.err{color:var(--red);}
+
+  /* 底部信息卡 */
+  .info-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+  .info{border:1px solid var(--line);border-radius:14px;background:var(--card);padding:16px 18px;}
+  .info .it{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;margin-bottom:8px;}
+  .info .it svg{width:15px;height:15px;flex:none;}
+  .info p{font-size:12px;color:var(--sub);line-height:1.7;word-break:break-all;}
+  .info p b{color:#C6CCD8;font-weight:600;}
+  .mini-btn{display:inline-flex;align-items:center;gap:5px;margin-top:9px;font-size:12px;font-weight:600;
+    color:var(--cyan);background:rgba(35,173,229,.1);border:1px solid rgba(35,173,229,.3);
+    border-radius:8px;padding:5px 11px;cursor:pointer;font-family:inherit;}
+  .mini-btn svg{width:12px;height:12px;}
+
+  .foot{margin-top:26px;font-size:11.5px;color:#6B7280;line-height:1.8;text-align:center;}
+  .foot b{color:#8A919E;}
+
+  /* 登录弹层 */
+  .mask{position:fixed;inset:0;background:rgba(8,9,13,.68);backdrop-filter:blur(3px);
+    display:none;align-items:center;justify-content:center;z-index:50;padding:20px;}
+  .mask.show{display:flex;}
+  .modal{width:400px;max-width:100%;background:linear-gradient(180deg,#232531,#1D1E28);
+    border:1px solid #323442;border-radius:20px;box-shadow:0 30px 80px rgba(0,0,0,.6);
+    padding:28px 28px 24px;text-align:center;}
+  .modal h3{font-size:18px;font-weight:700;}
+  .modal .ms{font-size:12.5px;color:var(--sub);margin-top:7px;line-height:1.7;}
+  .qrbox{width:196px;height:196px;margin:20px auto 14px;background:#fff;border-radius:14px;padding:12px;
+    display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 5px rgba(251,114,153,.14);}
+  .qrbox img{width:100%;height:100%;}
+  .qrbox.expired{flex-direction:column;gap:12px;color:#555;font-size:13px;}
+  .scan-state{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;
+    border-radius:999px;padding:7px 16px;}
+  .scan-state.cyan{color:var(--cyan);background:rgba(35,173,229,.1);border:1px solid rgba(35,173,229,.3);}
+  .scan-state.green{color:var(--green);background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.28);}
+  .scan-state.gray{color:var(--sub);background:rgba(154,161,178,.1);border:1px solid rgba(154,161,178,.25);}
+  .scan-state .d{width:7px;height:7px;border-radius:50%;background:currentColor;}
+  .modal .cancel{margin-top:18px;font-size:13px;color:var(--sub);background:transparent;border:none;
+    font-family:inherit;cursor:pointer;padding:6px 18px;border-radius:8px;}
+  .modal .cancel:hover{background:rgba(255,255,255,.06);}
+  .modal .safe{margin-top:10px;font-size:11px;color:#6B7280;line-height:1.7;}
+
+  /* toast */
+  .toasts{position:fixed;top:20px;right:20px;z-index:80;display:flex;flex-direction:column;gap:10px;}
+  .toast{min-width:240px;max-width:380px;padding:12px 16px;border-radius:12px;font-size:13px;
+    background:#232531;border:1px solid #3A3D4B;color:var(--ink);box-shadow:0 14px 40px rgba(0,0,0,.5);
+    display:flex;gap:10px;align-items:flex-start;animation:slidein .25s ease;}
+  .toast .ti{flex:none;width:18px;height:18px;border-radius:50%;font-size:12px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;color:#fff;}
+  .toast.ok .ti{background:var(--green);} .toast.err .ti{background:var(--red);}
+  .toast.info .ti{background:var(--cyan);}
+  @keyframes slidein{from{transform:translateX(30px);opacity:0;}to{transform:none;opacity:1;}}
+
+  @media (max-width:980px){
+    .fmts .tag{padding:9px 12px;}
+  }
+  @media (max-width:860px){
+    .canvas{padding:0 16px 36px;}
+    .topbar{height:auto;padding:14px 0;flex-wrap:wrap;}
+    .brand .sub{display:none;}
+    .pill span:last-child{display:none;}
+    .opts{grid-template-columns:1fr;gap:0;}
+    .file-grid{grid-template-columns:repeat(2,1fr);}
+    .info-grid{grid-template-columns:1fr;}
+    .main{padding-top:20px;}
+  }
+  @media (max-width:520px){
+    .file-grid{grid-template-columns:1fr;}
+    .acct-chip .nm small{display:none;}
+    .ver{display:none;}
+    .seg span{padding:9px 13px;}
+  }
+</style>
+</head>
+<body>
+<div class="canvas">
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16v11H4z" fill="#fff" opacity=".95"/><path d="M8 6l1.5-2.2M16 6l-1.5-2.2" stroke="#fff" stroke-width="1.7" stroke-linecap="round"/><path d="M9 11.5l3 3 3.5-4" stroke="#FB7299" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div>
+        <h1>BiliScribe</h1>
+        <div class="sub">B站视频字幕本地提取</div>
+      </div>
+    </div>
+    <div class="top-right">
+      <span class="pill" id="svcPill"><span class="d"></span><span>本地服务 127.0.0.1</span></span>
+      <span id="acctArea"></span>
+      <span class="ver" id="ver"></span>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="page-title">提取字幕</div>
+    <div class="page-desc">粘贴视频链接，自动获取 CC / AI 字幕并导出为 SRT、文稿等格式 · 支持多链接、b23.tv 短链与分P</div>
+
+    <div class="card">
+      <div class="bd">
+        <div class="input-wrap">
+          <textarea id="urls" placeholder="粘贴 B 站视频链接，支持多个（每行一个）&#10;例如：https://www.bilibili.com/video/BV11gYd6UEPv/&#10;支持 b23.tv 短链、带 ?p= 的分P链接"></textarea>
+          <div class="input-foot">
+            <button type="button" class="chip-mini" id="exampleBtn">填入示例链接</button>
+            <span class="cnt" id="urlCnt"></span>
+          </div>
+        </div>
+
+        <div class="opt-label">导出格式（可多选）</div>
+        <div class="fmts" id="fmtBox">
+          <button type="button" class="tag on" data-f="srt"><span class="tick"><svg viewBox="0 0 12 12"><path d="M2 6.2l2.4 2.3L10 3" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/></svg></span>SRT <small>字幕</small></button>
+          <button type="button" class="tag on" data-f="txt"><span class="tick"><svg viewBox="0 0 12 12"><path d="M2 6.2l2.4 2.3L10 3" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/></svg></span>TXT <small>文稿</small></button>
+          <button type="button" class="tag" data-f="vtt"><span class="tick"><svg viewBox="0 0 12 12"><path d="M2 6.2l2.4 2.3L10 3" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/></svg></span>VTT <small>网页字幕</small></button>
+          <button type="button" class="tag" data-f="json"><span class="tick"><svg viewBox="0 0 12 12"><path d="M2 6.2l2.4 2.3L10 3" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/></svg></span>JSON <small>原始数据</small></button>
+          <button type="button" class="tag" data-f="md"><span class="tick"><svg viewBox="0 0 12 12"><path d="M2 6.2l2.4 2.3L10 3" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/></svg></span>Markdown <small>笔记</small></button>
+        </div>
+
+        <div class="opts">
+          <div>
+            <div class="opt-label">分P范围</div>
+            <div class="opt-field">
+              <input type="text" id="pages" value="all">
+              <span class="hint">all = 全部，或 1,3,5-8</span>
+            </div>
+          </div>
+          <div>
+            <div class="opt-label">字幕语言</div>
+            <div class="seg" id="langSeg">
+              <span class="on" data-l="all">全部语言</span><span data-l="zh">仅中文</span><span data-l="en">仅英文</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-go" id="goBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>
+            <span id="goText">开始提取</span>
+          </button>
+          <button class="btn-folder" id="folderBtn" title="打开输出文件夹" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#9AA1B2" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>
+          </button>
+        </div>
+
+        <div class="run-box" id="runBox">
+          <div class="prow"><span id="runMsg">已提交...</span><span id="pctText">0%</span></div>
+          <div class="bar"><i id="progBar"></i></div>
+          <pre class="log" id="log"></pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="resCard" style="display:none;">
+      <div class="hd">
+        <span class="hd-ico"><svg viewBox="0 0 24 24" fill="none" stroke="#FF8FB0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11.5l2 2 4-4.5"/><circle cx="12" cy="12" r="9"/></svg></span>
+        <h2>提取结果</h2><span id="resSummary"></span>
+      </div>
+      <div class="bd" id="resBody" style="padding-top:14px;"></div>
+    </div>
+
+    <div class="info-grid">
+      <div class="info">
+        <div class="it"><svg viewBox="0 0 24 24" fill="none" stroke="#23ADE5" stroke-width="1.9"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-3.6 3.6-5.5 8-5.5s8 1.9 8 5.5" stroke-linecap="round"/></svg>账号与凭证</div>
+        <p id="acctInfo">检查中...</p>
+        <button class="mini-btn" id="reloginBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3M21 17v4h-4"/></svg>
+          <span id="reloginText">扫码登录</span>
+        </button>
+      </div>
+      <div class="info">
+        <div class="it"><svg viewBox="0 0 24 24" fill="none" stroke="#23ADE5" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>输出文件夹</div>
+        <p id="outDirInfo">...</p>
+        <button class="mini-btn" id="openOutBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 20h14"/></svg>
+          打开文件夹
+        </button>
+      </div>
+      <div class="info">
+        <div class="it"><svg viewBox="0 0 24 24" fill="none" stroke="#23ADE5" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>使用提示</div>
+        <p>每行一个链接，支持 <b>b23.tv 短链</b>与 <b>?p= 分P</b>；仅能提取视频本身带有的 CC / AI 字幕，没有字幕的视频可用后续 ASR 转写兜底。</p>
+      </div>
+    </div>
+
+    <div class="foot">
+      <b>合规提示</b>：本工具仅用于个人学习研究，请使用本人账号访问你本有权限观看的内容，请勿大规模爬取、公开再发布字幕或用于商业用途。字幕版权归 UP 主与哔哩哔哩所有。
+    </div>
+  </div>
+</div>
+
+<!-- 扫码登录弹层 -->
+<div class="mask" id="loginMask">
+  <div class="modal">
+    <h3 id="loginTitle">扫码登录 B 站账号</h3>
+    <div class="ms" id="loginSub">字幕提取需要登录 B 站<br>登录凭证仅保存在本机，有效期约 180 天</div>
+    <div class="qrbox" id="qrBox"><img id="qrImg" alt="登录二维码"></div>
+    <div class="scan-state cyan" id="scanState"><span class="d"></span><span id="scanText">正在生成二维码...</span></div>
+    <div><button class="cancel" id="loginCancel">取消</button></div>
+    <div class="safe">二维码由 B 站官方登录接口生成，不会上传你的账号密码</div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+(function(){
+  "use strict";
+  var $ = function(id){ return document.getElementById(id); };
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function basename(p){ return String(p).split(/[\\/]/).pop(); }
+  function fmtDate(ts){
+    if(!ts) return '';
+    var d = new Date(ts*1000);
+    return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  }
+  function fmtDur(sec){
+    sec = parseInt(sec||0,10);
+    var h=Math.floor(sec/3600), m=Math.floor(sec%3600/60), s=sec%60;
+    return h ? h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0') : m+':'+String(s).padStart(2,'0');
+  }
+
+  /* ---------- toast ---------- */
+  function toast(msg, type){
+    type = type || 'info';
+    var box = $('toasts'), el = document.createElement('div');
+    el.className = 'toast '+type;
+    var icon = type==='ok'?'✓':(type==='err'?'!':'i');
+    el.innerHTML = '<span class="ti">'+icon+'</span><span>'+esc(msg)+'</span>';
+    box.appendChild(el);
+    setTimeout(function(){ el.style.opacity='0'; el.style.transition='opacity .3s';
+      setTimeout(function(){ el.remove(); }, 320); }, 3800);
+  }
+
+  /* ---------- 登录状态 ---------- */
+  var state = { logged:false, uname:'', expires:null, outDir:'', offline:false };
+
+  function renderAccount(){
+    var area = $('acctArea');
+    if(state.logged){
+      var av = esc((state.uname||'?').charAt(0));
+      var exp = state.expires ? '<small>凭证有效至 '+fmtDate(state.expires)+'</small>' : '<small>已登录</small>';
+      area.innerHTML = '<button class="acct-chip" id="acctChip" title="点击可重新扫码登录">'
+        +'<span class="av">'+av+'</span><span class="nm">'+esc(state.uname)+exp+'</span></button>';
+      $('acctChip').onclick = function(){ openLogin('重新扫码登录','新登录将替换当前账号凭证'); };
+      $('acctInfo').innerHTML = '当前登录 <b>'+esc(state.uname)+'</b>'
+        +(state.expires?'，凭证有效至 <b>'+fmtDate(state.expires)+'</b>，过期后重新扫码即可':'');
+      $('reloginText').textContent = '重新扫码登录';
+    } else if(state.offline){
+      area.innerHTML = '<span class="pill warn"><span class="d"></span><span>网络异常，登录态未校验</span></span>';
+      $('acctInfo').innerHTML = '网络异常，无法联网校验登录态（本地账号 <b>'+esc(state.uname||'未知')+'</b>），网络恢复后刷新页面即可';
+      $('reloginText').textContent = '重新扫码登录';
+    } else {
+      area.innerHTML = '<button class="login-top" id="loginTopBtn">'
+        +'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3M21 17v4h-4"/></svg>扫码登录</button>';
+      $('loginTopBtn').onclick = function(){ openLogin(); };
+      $('acctInfo').textContent = '尚未登录，扫码登录后即可提取字幕';
+      $('reloginText').textContent = '扫码登录';
+    }
+  }
+
+  function loadStatus(){
+    return fetch('/api/status').then(function(r){return r.json();}).then(function(d){
+      state.logged = !!d.logged_in;
+      state.offline = !!d.offline;
+      state.uname = d.uname || d.saved_uname || '';
+      state.expires = d.expires || null;
+      state.outDir = d.output_dir || '';
+      $('ver').textContent = d.version ? 'v'+d.version : '';
+      $('outDirInfo').innerHTML = '字幕文件保存在 <b>'+esc(state.outDir)+'</b>，多P视频自动建立子文件夹。';
+      renderAccount();
+    }).catch(function(){
+      $('svcPill').className = 'pill warn';
+      $('svcPill').innerHTML = '<span class="d"></span><span>服务连接失败</span>';
+    });
+  }
+
+  /* ---------- 扫码登录 ---------- */
+  var pollTimer = null;
+  function openLogin(title, sub){
+    $('loginTitle').textContent = title || '扫码登录 B 站账号';
+    $('loginSub').innerHTML = sub ? esc(sub)+'<br>登录凭证仅保存在本机，有效期约 180 天'
+      : '字幕提取需要登录 B 站<br>登录凭证仅保存在本机，有效期约 180 天';
+    $('loginMask').classList.add('show');
+    startQr();
+  }
+  function closeLogin(){
+    $('loginMask').classList.remove('show');
+    if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+  }
+  function setScan(cls, text){
+    var el = $('scanState');
+    el.className = 'scan-state '+cls;
+    $('scanText').textContent = text;
+  }
+  function startQr(){
+    var box=$('qrBox'); box.className='qrbox'; box.innerHTML='<img id="qrImg" alt="登录二维码">';
+    setScan('cyan','正在生成二维码...');
+    fetch('/api/login/start',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+      if(!d.qr){ setScan('gray','二维码生成失败，请关闭后重试'); return; }
+      $('qrImg').src = d.qr;
+      setScan('cyan','请使用手机 B 站 App 扫码（180 秒内）');
+      pollLogin();
+    }).catch(function(){ setScan('gray','二维码生成失败，请检查网络'); });
+  }
+  function pollLogin(){
+    if(pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(function(){
+      fetch('/api/login/poll').then(function(r){return r.json();}).then(function(d){
+        if(d.state==='scanned'){ setScan('green','已扫码，请在手机上点确认'); }
+        else if(d.state==='success'){
+          clearInterval(pollTimer); pollTimer=null;
+          closeLogin(); toast('登录成功：'+(d.uname||''),'ok'); loadStatus();
+        } else if(d.state==='expired'){
+          clearInterval(pollTimer); pollTimer=null;
+          var box=$('qrBox'); box.className='qrbox expired';
+          box.innerHTML='<span>二维码已失效</span><button class="mini-btn" id="qrRetry">重新获取二维码</button>';
+          setScan('gray','二维码已失效');
+          $('qrRetry').onclick = startQr;
+        }
+      }).catch(function(){});
+    }, 2000);
+  }
+  $('loginCancel').onclick = closeLogin;
+  $('loginMask').addEventListener('click', function(e){
+    if(e.target === this) closeLogin();
+  });
+  $('reloginBtn').onclick = function(){
+    if(state.logged) openLogin('重新扫码登录','新登录将替换当前账号凭证');
+    else openLogin();
+  };
+
+  /* ---------- 格式 / 语言 / 链接计数 ---------- */
+  function pickedFormats(){
+    return Array.prototype.slice.call(document.querySelectorAll('#fmtBox .tag.on'))
+      .map(function(t){ return t.getAttribute('data-f'); });
+  }
+  document.querySelectorAll('#fmtBox .tag').forEach(function(t){
+    t.onclick = function(){ t.classList.toggle('on'); };
+  });
+  var langMode = 'all';
+  document.querySelectorAll('#langSeg span').forEach(function(s){
+    s.onclick = function(){
+      document.querySelectorAll('#langSeg span').forEach(function(x){x.classList.remove('on');});
+      s.classList.add('on'); langMode = s.getAttribute('data-l');
+    };
+  });
+  var URL_RE = /https?:\/\/[^\s,，;；。！？!?、）)】」』》"'’”…]+/g;
+  function countUrls(){
+    var raw = $('urls').value.match(URL_RE) || [];
+    var n = raw.filter(function(u){ return /bilibili\.com|b23\.tv/.test(u); }).length;
+    $('urlCnt').textContent = n ? '已识别 '+n+' 个链接' : '';
+  }
+  $('urls').addEventListener('input', countUrls);
+  $('exampleBtn').onclick = function(){
+    $('urls').value = 'https://www.bilibili.com/video/BV11gYd6UEPv/';
+    countUrls();
+  };
+
+  /* ---------- 提取作业 ---------- */
+  var jobTimer = null;
+  function setRunning(on){
+    $('goBtn').disabled = on;
+    $('goText').textContent = on ? '提取中，请稍候…' : '开始提取';
+  }
+  function startExtract(){
+    var urls = $('urls').value.trim();
+    if(!urls){ toast('请先粘贴视频链接','err'); $('urls').focus(); return; }
+    var fmts = pickedFormats();
+    if(!fmts.length){ toast('至少选择一种导出格式','err'); return; }
+    var langs = langMode==='all' ? ['all'] : [langMode];
+    $('runBox').style.display='block';
+    $('resCard').style.display='none';
+    $('log').textContent='已提交作业...\n';
+    $('progBar').style.width='0%'; $('pctText').textContent='0%';
+    $('runMsg').innerHTML='<span class="queued-tag">排队中，等待前一个作业完成…</span>';
+    setRunning(true);
+    fetch('/api/extract',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({urls:urls, fmts:fmts, pages:$('pages').value||'all', langs:langs})})
+      .then(function(r){
+        if(r.status===401){ closeLogin(); openLogin(); throw new Error('未登录'); }
+        return r.json();
+      }).then(function(d){
+        if(d.error){ toast(d.error,'err'); setRunning(false); $('runBox').style.display='none'; return; }
+        pollJob(d.job_id);
+      }).catch(function(e){
+        setRunning(false);
+        if(e.message!=='未登录'){ $('runBox').style.display='none'; toast('提交失败：'+e.message,'err'); }
+      });
+  }
+  $('goBtn').onclick = startExtract;
+
+  function pollJob(id){
+    if(jobTimer) clearInterval(jobTimer);
+    var seen = 0;  // 每个作业独立日志游标, 避免连续提交时日志错乱
+    jobTimer = setInterval(function(){
+      fetch('/api/jobs/'+id).then(function(r){return r.json();}).then(function(j){
+        if(!j || j.error) return;
+        $('progBar').style.width=(j.percent||0)+'%';
+        $('pctText').textContent=(j.percent||0)+'%';
+        if(j.status==='queued'){
+          $('runMsg').innerHTML='<span class="queued-tag">排队中，等待前一个作业完成…</span>';
+        } else if(j.logs && j.logs.length){
+          var first = j.logs[0] || '';
+          $('runMsg').innerHTML = j.status==='running' ? '正在提取… <b>'+esc(first.replace(/^\[[\d:]+\]\s*/,''))+'</b>' : '作业结束';
+        }
+        while(seen < (j.logs||[]).length){
+          $('log').textContent += j.logs[seen]+'\n'; seen++;
+          $('log').scrollTop = $('log').scrollHeight;
+        }
+        if(['done','need_login','error'].indexOf(j.status)>=0){
+          clearInterval(jobTimer); jobTimer=null; setRunning(false);
+          finishJob(j);
+        }
+      }).catch(function(){});
+    }, 1000);
+  }
+
+  function finishJob(j){
+    if(j.status==='need_login'){
+      toast('登录已失效，请重新扫码','err');
+      openLogin(); return;
+    }
+    if(j.status==='error'){
+      toast('作业失败：'+(j.logs[j.logs.length-1]||'未知错误'),'err');
+    }
+    renderResults(j);
+  }
+
+  var FT_COLOR = {srt:'srt',vtt:'vtt',txt:'txt',json:'json',md:'md'};
+  function fileBlock(f){
+    var name = basename(f), ext = (name.split('.').pop()||'').toLowerCase();
+    var cls = FT_COLOR[ext] || 'txt';
+    return '<a class="file" href="/api/download?path='+encodeURIComponent(f)+'" download="'+esc(name)+'">'
+      +'<span class="ft '+cls+'">'+esc(ext.toUpperCase())+'</span>'
+      +'<span class="fn" title="'+esc(name)+'">'+esc(name)+'</span>'
+      +'<span class="dl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 20h14"/></svg>下载</span></a>';
+  }
+  function renderResults(j){
+    var results = j.results || [];
+    if(!results.length){ return; }
+    var okN=0, trackN=0, fileN=0;
+    results.forEach(function(r){
+      if(r.status==='ok') okN++;
+      trackN += r.tracks||0; fileN += (r.files||[]).length;
+    });
+    var summary;
+    if(okN===results.length) summary = '<span class="ok-badge">成功 · '+trackN+' 条字幕轨 · '+fileN+' 个文件</span>';
+    else if(okN>0) summary = '<span class="warn-badge">部分成功 · '+okN+'/'+results.length+' 个视频</span>';
+    else summary = '<span class="err-badge">未提取到字幕</span>';
+    $('resSummary').innerHTML = summary;
+
+    var html='';
+    results.forEach(function(r){
+      var badge, txt;
+      if(r.status==='ok'){ badge='ok-badge'; txt='成功'; }
+      else if(r.status==='no_subtitle'){ badge='warn-badge'; txt='无字幕'; }
+      else { badge='err-badge'; txt='失败'; }
+      var title = esc(r.title || r.url || '未知视频');
+      var meta = [];
+      if(r.owner) meta.push('UP主：'+esc(r.owner));
+      if(r.duration) meta.push('时长 '+fmtDur(r.duration));
+      if(r.pages_total>1) meta.push((r.pages_total||0)+'P');
+      if(r.bvid) meta.push(esc(r.bvid));
+      var pic = r.pic ? '<img src="'+esc(r.pic)+'" referrerpolicy="no-referrer" alt="" '
+        +'onerror="this.style.display=\'none\'">' : '';
+      html += '<div class="video"><div class="video-hd"><div class="thumb">'+pic+'</div>'
+        +'<div class="vt"><div class="t"><span class="'+badge+'" style="margin-right:8px;">'+txt+'</span>'+title+'</div>'
+        +'<div class="m">'+meta.join(' · ')+'</div></div></div>';
+      if(r.files && r.files.length){
+        html += '<div class="file-grid">'+r.files.map(fileBlock).join('')+'</div>';
+      }
+      if(r.status==='no_subtitle'){
+        var ps = (r.no_subtitle_pages||[]).length ? '（分P：'+r.no_subtitle_pages.join(',')+'）' : '';
+        html += '<div class="sub-msg">该视频没有 CC/AI 字幕'+ps+'，后续版本可用语音转写（ASR）兜底。</div>';
+      }
+      if(r.status==='error'){
+        html += '<div class="sub-msg err">失败原因：'+esc(r.message||'未知错误')+'</div>';
+      }
+      html += '</div>';
+    });
+    $('resBody').innerHTML = html;
+    $('resCard').style.display='block';
+    if(okN===results.length) toast('提取完成，共 '+fileN+' 个文件','ok');
+  }
+
+  /* ---------- 输出文件夹 ---------- */
+  function openOutput(){
+    fetch('/api/open-output',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+      if(d && d.ok===false) toast('打开失败：'+(d.error||''),'err');
+    }).catch(function(){});
+  }
+  $('folderBtn').onclick = openOutput;
+  $('openOutBtn').onclick = openOutput;
+
+  /* ---------- 初始化 ---------- */
+  loadStatus();
+})();
+</script>
+</body>
+</html>

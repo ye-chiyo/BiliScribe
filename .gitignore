@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据(含登录凭证, 绝不能提交)
+data/cookies.json
+data/cache/
+data/*.tmp
+data/qr_login.png
+
+# 用户导出的字幕文件
+output/
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 预览缓存
+.preview/
