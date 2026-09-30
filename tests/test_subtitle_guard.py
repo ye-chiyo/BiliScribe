@@ -139,6 +139,16 @@ def test_empty_then_success():
     print("[PASS] 空列表退避重试行为保持正常")
 
 
+def test_all_rounds_empty_is_no_subtitle():
+    h = _Harness([v2_data()] * 5)
+    try:
+        assert h.client.get_subtitle_list(BVID, AID, CID) == []
+        assert len(h.calls) == 5
+    finally:
+        h.close()
+    print("[PASS] 持续空列表按无字幕处理, 不误报串轨")
+
+
 def test_no_bvid_raises():
     h = _Harness([])
     try:
@@ -189,6 +199,7 @@ if __name__ == "__main__":
     test_all_rounds_bad_raises()
     test_dirty_cache_discarded()
     test_empty_then_success()
+    test_all_rounds_empty_is_no_subtitle()
     test_no_bvid_raises()
     test_body_cache_key_is_stable_rid()
     print("\n字幕归属校验回归全部通过")

@@ -238,6 +238,7 @@ class BiliClient:
         # 限流空列表 / 串轨都靠退避重试解决; 每轮重新预热视频页
         waits = [0, 3, 6, 10, 15]
         partial: dict[str, dict] = {}
+        saw_foreign_track = False
         for rnd, w in enumerate(waits):
             if w:
                 time.sleep(w)
@@ -252,6 +253,7 @@ class BiliClient:
             good = [t for t in subs if track_belongs_to_video(t, aid, cid)]
             bad = len(subs) - len(good)
             if bad:
+                saw_foreign_track = True
                 log(f"字幕接口返回了其他视频的字幕轨, 正在重试"
                     f"({rnd + 1}/{len(waits)})")
             for t in good:
@@ -268,6 +270,8 @@ class BiliClient:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             cf.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
             return merged
+        if not saw_foreign_track:
+            return []
         raise BiliError(-1, "字幕接口多次返回其他视频的数据, 请稍后重试")
 
     def fetch_subtitle(self, subtitle_url: str, bvid: str) -> list[dict]:

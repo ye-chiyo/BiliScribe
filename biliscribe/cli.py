@@ -160,9 +160,9 @@ def build_parser():
 
     pe = sub.add_parser("extract", help="提取字幕")
     pe.add_argument("urls", nargs="*", help="视频链接(可多个, 也可粘贴文本/管道输入)")
-    pe.add_argument("--fmts", default="srt,txt", help="格式: srt,vtt,txt,json,md")
+    pe.add_argument("--fmts", default="md", help="格式: srt,vtt,txt,json,md (默认 md)")
     pe.add_argument("--pages", default="all", help="分P: all 或 1,3,5-8")
-    pe.add_argument("--langs", default="all", help="语言代码, 默认 all")
+    pe.add_argument("--langs", default="zh", help="语言代码, 默认 zh")
     pe.add_argument("--out", default=None, help="输出目录")
     pe.set_defaults(func=cmd_extract)
 

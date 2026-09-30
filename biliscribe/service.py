@@ -46,20 +46,25 @@ def _pick_tracks(tracks: list[dict], langs: list[str]) -> list[dict]:
         return tracks
     wanted = {l.strip().lower() for l in langs if l.strip()}
     picked = [t for t in tracks if _lang_match(t.get("lan", ""), wanted)]
-    return picked or tracks  # 指定语言不存在时退回全部, 避免空结果
+    return picked
 
 
 def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
                 pages_spec: str, langs: list[str], out_dir: Path,
                 log) -> dict:
     url = client.resolve(raw_url.strip())
-    bvid, aid, _ = parse_video_url(url)
+    bvid, aid, linked_page = parse_video_url(url)
     if not bvid and not aid:
         raise BiliError(-1, "链接中未找到 BV/av 号")
     info = client.get_video_info(bvid=bvid, aid=aid)
     bvid = info["bvid"]
     total = len(info["pages"])
     page_nos = parse_pages_spec(pages_spec, total)
+    # 没有另行指定分 P 时，遵从链接中的 ?p=；普通链接仍处理全部分 P。
+    if pages_spec.strip().lower() in ("all", "*", "") and re.search(r"[?&]p=\d+", url):
+        page_nos = [linked_page] if 1 <= linked_page <= total else []
+    if not page_nos:
+        raise ValueError("没有有效的分 P 页码，请检查链接或分 P 选项")
     log(f"视频《{info['title']}》UP主:{info['owner']} | 共 {total} P, 本次处理 {len(page_nos)} P")
 
     result = {"url": raw_url, "bvid": bvid, "title": info["title"],
@@ -84,7 +89,7 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
                                           on_log=log)
         tracks = _pick_tracks(tracks, langs)
         if not tracks:
-            log(f"  {label}: 无 CC/AI 字幕(可后续用 ASR 兜底)")
+            log(f"  {label}: 无所选语言的 CC/AI 字幕")
             result["no_subtitle_pages"].append(pno)
         for t in tracks:
             body = client.fetch_subtitle(t["subtitle_url"], bvid)
@@ -142,8 +147,8 @@ class JobManager:
         with self.lock:
             self.jobs[job_id] = job
             self._prune_locked()
-        self._q.put((job, urls, fmts or ["srt", "txt"], pages_spec,
-                     langs or ["all"], out))
+        self._q.put((job, urls, fmts or ["md"], pages_spec,
+                     langs or ["zh"], out))
         self._ensure_worker()
         return job_id
 

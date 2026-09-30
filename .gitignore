@@ -23,3 +23,11 @@ Thumbs.db
 
 # 预览缓存
 .preview/
+
+# Sites local build files
+site/node_modules/
+site/.npm-cache/
+site/dist/
+site/.sites-runtime/
+site/.sites-checkout/
+site/*.tar.gz

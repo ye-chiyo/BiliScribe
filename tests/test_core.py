@@ -5,7 +5,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from biliscribe.api import extract_urls, parse_video_url
-from biliscribe.service import _pick_tracks, parse_pages_spec
+from biliscribe.cli import build_parser
+from biliscribe.service import _pick_tracks, extract_one, parse_pages_spec
+from biliscribe.service import JobManager
+from biliscribe.web.server import ExtractReq
 from biliscribe.subtitles import (_hms, safe_filename, to_md, to_srt, to_txt,
                                   to_vtt)
 
@@ -82,8 +85,91 @@ def test_pick_tracks_lang_family():
     assert {t["lan"] for t in picked} == {"ai-zh", "zh-CN"}
     assert {t["lan"] for t in _pick_tracks(tracks, ["en"])} == {"ai-en"}
     assert len(_pick_tracks(tracks, ["all"])) == 4
-    # 指定语言不存在时退回全部
-    assert len(_pick_tracks(tracks, ["ja"])) == 4
+    # 指定语言不存在时不得导出其他语言
+    assert _pick_tracks(tracks, ["ja"]) == []
+
+
+def test_linked_page_and_language_filter():
+    import tempfile
+
+    class Client:
+        def __init__(self):
+            self.cids = []
+
+        def resolve(self, url):
+            return url
+
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "pages": [
+                        {"page": 1, "cid": 101, "part": "一"},
+                        {"page": 2, "cid": 102, "part": "二"}]}
+
+        def get_subtitle_list(self, bvid, aid, cid, on_log=None):
+            self.cids.append(cid)
+            return [{"lan": "ai-en", "lan_doc": "English",
+                     "subtitle_url": "https://example.com/subtitle"}]
+
+        def fetch_subtitle(self, url, bvid):
+            raise AssertionError("不应下载未选语言")
+
+    with tempfile.TemporaryDirectory() as temp:
+        client = Client()
+        result = extract_one(client,
+            "https://www.bilibili.com/video/BV11gYd6UEPv/?p=2",
+            ["txt"], "all", ["zh"], Path(temp), lambda msg: None)
+        assert client.cids == [102]
+        assert result["status"] == "no_subtitle"
+        assert result["no_subtitle_pages"] == [2]
+
+
+def test_extract_writes_selected_language():
+    import tempfile
+
+    class Client:
+        def resolve(self, url):
+            return url
+
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "pages": [
+                        {"page": 1, "cid": 101, "part": "正片"}]}
+
+        def get_subtitle_list(self, bvid, aid, cid, on_log=None):
+            return [{"lan": "ai-zh", "lan_doc": "中文",
+                     "subtitle_url": "https://example.com/subtitle"}]
+
+        def fetch_subtitle(self, url, bvid):
+            return BODY
+
+        def polite_sleep(self):
+            pass
+
+    with tempfile.TemporaryDirectory() as temp:
+        result = extract_one(Client(),
+            "https://www.bilibili.com/video/BV11gYd6UEPv/",
+            ["srt", "txt"], "all", ["zh"], Path(temp), lambda msg: None)
+        assert result["status"] == "ok"
+        assert len(result["files"]) == 2
+        srt = next(Path(f) for f in result["files"] if f.endswith(".srt"))
+        assert srt.read_bytes().startswith(b"\xef\xbb\xbf")
+        assert "你好" in srt.read_text(encoding="utf-8-sig")
+
+
+def test_default_markdown_chinese():
+    import tempfile
+
+    args = build_parser().parse_args(["extract", "https://www.bilibili.com/video/BV11gYd6UEPv/"])
+    assert args.fmts == "md" and args.langs == "zh"
+    req = ExtractReq(urls="https://www.bilibili.com/video/BV11gYd6UEPv/")
+    assert req.fmts == ["md"] and req.langs == ["zh"]
+
+    with tempfile.TemporaryDirectory() as temp:
+        mgr = JobManager()
+        mgr._ensure_worker = lambda: None
+        mgr.create(req.urls, out_dir=temp)
+        queued = mgr._q.get_nowait()
+        assert queued[2] == ["md"] and queued[4] == ["zh"]
 
 
 def test_pages_spec_garbage():

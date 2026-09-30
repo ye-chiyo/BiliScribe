@@ -20,9 +20,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 class ExtractReq(BaseModel):
     urls: str
-    fmts: list[str] = ["srt", "txt"]
+    fmts: list[str] = ["md"]
     pages: str = "all"
-    langs: list[str] = ["all"]
+    langs: list[str] = ["zh"]
     out_dir: str | None = None
 
 
