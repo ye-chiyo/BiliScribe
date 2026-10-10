@@ -123,6 +123,8 @@
   .run-box{margin-top:20px;background:var(--input);border-radius:13px;padding:14px 16px;
     border:1px solid var(--line);display:none;}
   .run-box.active{box-shadow:0 0 0 1px rgba(35,173,229,.18),0 10px 30px rgba(0,0,0,.14);}
+  .run-box.active .prow b{color:var(--cyan);}
+  .run-box.active .prow b::after{content:'  •  •  •';display:inline-block;letter-spacing:3px;color:var(--pink);animation:workingDots 1.1s steps(3,end) infinite;}
   .prow{display:flex;justify-content:space-between;font-size:12.5px;color:var(--sub);margin-bottom:9px;gap:10px;}
   .prow b{color:var(--ink);}
   .queued-tag{color:var(--amber);font-weight:600;}
@@ -221,6 +223,7 @@
   .toast.info .ti{background:var(--cyan);}
   @keyframes slidein{from{transform:translateY(6px);opacity:0;}to{transform:none;opacity:1;}}
   @keyframes progressGlow{from{background-position:0 0;}to{background-position:180px 0;}}
+  @keyframes workingDots{0%{opacity:.25;transform:translateX(-2px);}50%{opacity:1;transform:translateX(0);}100%{opacity:.25;transform:translateX(2px);}}
 
   /* 字幕工作台：克制的深蓝底色，时间轴是主视觉，粉色只用于当前操作。 */
   :root{
