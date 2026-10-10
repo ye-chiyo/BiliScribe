@@ -254,7 +254,8 @@ class BiliClient:
         # 实测: 必须先打开视频页完成会话关联, 否则字幕列表会被裁剪
         self.prime_video_page(bvid, aid)
 
-        query = f"bvid={bvid}&cid={cid}"
+        # 给 player/v2 加短时唯一参数，避免 B 站/CDN 将错误的旧字幕列表持续缓存到同一键。
+        query = f"bvid={bvid}&cid={cid}&_ts={time.time_ns()}"
         # 限流空列表 / 串轨都靠退避重试解决; 每轮重新预热视频页
         waits = [0, 1, 2]
         partial: dict[str, dict] = {}

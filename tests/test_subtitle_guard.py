@@ -83,6 +83,7 @@ def test_retry_until_owned():
         assert len(h.calls) == 2
         # 只允许 bvid 形式, 不得回退 aid 形式
         assert all("aid=" not in u for u in h.calls), h.calls
+        assert all("_ts=" in u for u in h.calls), h.calls
         assert any("其他视频" in m for m in logs)
         # 缓存落盘且为校验通过的结果
         cf = Path(h.tmp.name) / f"{CID}_list.json"

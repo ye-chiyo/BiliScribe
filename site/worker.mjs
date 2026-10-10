@@ -205,7 +205,7 @@ async function subtitleTracks(bvid, aid, cid, cookies) {
   let sawForeign = false;
   for (const delay of [0, 2000, 5000]) {
     if (delay) await new Promise(resolve => setTimeout(resolve, delay));
-    const data = await biliJson(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}`,
+    const data = await biliJson(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}&_ts=${Date.now()}-${Math.random().toString(36).slice(2)}`,
       cookies, referer);
     const tracks = data.subtitle?.subtitles || [];
     if (!tracks.length) continue;

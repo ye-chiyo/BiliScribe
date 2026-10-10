@@ -697,6 +697,7 @@
   }
 
   function finishJob(j){
+    $('runBox').style.display='none';
     if(j.status==='need_login'){
       toast('登录已失效，请重新扫码','err');
       openLogin(); return;

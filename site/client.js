@@ -150,6 +150,8 @@
   }
 
   function renderResults(results) {
+    $('runBox').style.display = 'none';
+    $('runBox').classList.remove('active');
     downloads.splice(0).forEach(url => URL.revokeObjectURL(url));
     let success = 0, tracks = 0, files = 0;
     const parts = [];
