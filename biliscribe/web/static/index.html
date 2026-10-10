@@ -303,6 +303,8 @@
   button:focus-visible,textarea:focus-visible,input:focus-visible,.file:focus-visible{
     outline:2px solid var(--cyan);outline-offset:3px;
   }
+  /* textarea uses the container focus ring; avoid drawing a second inner rectangle. */
+  textarea:focus-visible{outline:none;}
   button,.tag,.file{transition:background-color .18s ease,border-color .18s ease,transform .18s ease;}
   @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition-duration:.01ms!important;scroll-behavior:auto!important;}}
 
