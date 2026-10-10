@@ -95,7 +95,7 @@ def test_retry_until_owned():
 
 
 def test_all_rounds_bad_raises():
-    h = _Harness([v2_data(t(ZH_BAD))] * 5)
+    h = _Harness([v2_data(t(ZH_BAD))] * 3)
     try:
         raised = False
         try:
@@ -104,7 +104,7 @@ def test_all_rounds_bad_raises():
             raised = True
             assert "其他视频" in e.message
         assert raised
-        assert len(h.calls) == 5
+        assert len(h.calls) == 3
         # 全部失败时不得写缓存
         assert not (Path(h.tmp.name) / f"{CID}_list.json").exists()
     finally:
@@ -140,10 +140,10 @@ def test_empty_then_success():
 
 
 def test_all_rounds_empty_is_no_subtitle():
-    h = _Harness([v2_data()] * 5)
+    h = _Harness([v2_data()] * 3)
     try:
         assert h.client.get_subtitle_list(BVID, AID, CID) == []
-        assert len(h.calls) == 5
+        assert len(h.calls) == 3
     finally:
         h.close()
     print("[PASS] 持续空列表按无字幕处理, 不误报串轨")

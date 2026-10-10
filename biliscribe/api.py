@@ -18,6 +18,9 @@ import qrcode
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 CACHE_TTL = 24 * 3600  # 字幕缓存 24 小时, 避免重复请求触发频控
+CONNECT_TIMEOUT = 8.0
+READ_TIMEOUT = 12.0
+TRANSIENT_RETRIES = 2
 
 def cleanup_cache(max_age: int = CACHE_TTL) -> int:
     """删除超过 TTL 的缓存文件, 返回清理数量。服务启动时调用一次。"""
@@ -115,7 +118,9 @@ class BiliClient:
             headers={"User-Agent": UA,
                      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                      "Accept": "application/json, text/plain, */*"},
-            follow_redirects=True, timeout=30,
+            follow_redirects=True,
+            timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT,
+                                   write=CONNECT_TIMEOUT, pool=CONNECT_TIMEOUT),
         )
         self._primed: set[str] = set()
         if setup_fingerprint:
@@ -132,7 +137,7 @@ class BiliClient:
         try:
             self.client.get(f"https://www.bilibili.com/video/{key}",
                             headers={"Referer": "https://www.bilibili.com/"})
-            time.sleep(1.5)
+            time.sleep(0.4)
             self._primed.add(key)
         except Exception:
             pass
@@ -166,13 +171,13 @@ class BiliClient:
     def _get_json(self, url: str, referer: str = "https://www.bilibili.com/",
                   retries: int = 2):
         last_exc = None
-        for attempt in range(retries + 1):
+        for attempt in range(min(retries, TRANSIENT_RETRIES) + 1):
             try:
                 r = self.client.get(url, headers={"Referer": referer})
                 d = r.json()
                 code = d.get("code", 0)
                 if code in RATE_ERRORS:
-                    wait = 3 + attempt * 3 + random.random() * 2
+                    wait = 0.6 * (2 ** attempt) + random.random() * 0.25
                     time.sleep(wait)
                     continue
                 if code != 0:
@@ -180,7 +185,8 @@ class BiliClient:
                 return d.get("data", {})
             except (httpx.HTTPError, ValueError) as e:
                 last_exc = e
-                time.sleep(1.5 * (attempt + 1))
+                if attempt < min(retries, TRANSIENT_RETRIES):
+                    time.sleep(0.5 * (2 ** attempt))
         raise BiliError(-1, f"请求失败: {last_exc}")
 
     def resolve(self, url: str) -> str:
@@ -236,7 +242,7 @@ class BiliClient:
 
         query = f"bvid={bvid}&cid={cid}"
         # 限流空列表 / 串轨都靠退避重试解决; 每轮重新预热视频页
-        waits = [0, 3, 6, 10, 15]
+        waits = [0, 1, 2]
         partial: dict[str, dict] = {}
         saw_foreign_track = False
         for rnd, w in enumerate(waits):
@@ -291,14 +297,15 @@ class BiliClient:
         # 不能走 _get_json, 需直接解析
         referer = f"https://www.bilibili.com/video/{bvid}"
         body: list[dict] = []
-        for attempt in range(3):
+        for attempt in range(TRANSIENT_RETRIES + 1):
             try:
                 r = self.client.get(subtitle_url, headers={"Referer": referer})
                 if r.status_code == 403:
                     # 403 多为会话关联过期: 重新预热视频页再试, 而非原样重放
                     if bvid:
                         self.prime_video_page(bvid, None, force=True)
-                    time.sleep(2 + attempt * 2)
+                    if attempt < TRANSIENT_RETRIES:
+                        time.sleep(0.5 * (2 ** attempt))
                     continue
                 r.raise_for_status()
                 body = r.json().get("body", []) or []
@@ -306,7 +313,8 @@ class BiliClient:
             except (httpx.HTTPError, ValueError):
                 if attempt == 2:
                     body = []
-                time.sleep(1.5 * (attempt + 1))
+                if attempt < TRANSIENT_RETRIES:
+                    time.sleep(0.5 * (2 ** attempt))
         if body:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             cf.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
@@ -329,7 +337,7 @@ class BiliClient:
 
     def polite_sleep(self):
         """批量请求间的礼貌限速。"""
-        time.sleep(1.6 + random.random() * 1.6)
+        time.sleep(0.5 + random.random() * 0.5)
 
 
 class QRLogin:
@@ -338,7 +346,9 @@ class QRLogin:
     def __init__(self):
         self.client = httpx.Client(
             headers={"User-Agent": UA, "Accept": "application/json, text/plain, */*"},
-            follow_redirects=True, timeout=30)
+            follow_redirects=True,
+            timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT,
+                                   write=CONNECT_TIMEOUT, pool=CONNECT_TIMEOUT))
         self.key: str | None = None
 
     def close(self):

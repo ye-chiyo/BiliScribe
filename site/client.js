@@ -176,6 +176,7 @@
     $('goBtn').disabled = true;
     $('goText').textContent = '正在提取…';
     $('runBox').style.display = 'block';
+    $('runBox').classList.add('active');
     $('resCard').style.display = 'none';
     $('runMsg').textContent = '正在从 B站获取字幕，请保持页面打开';
     $('log').textContent = '云端提取中…\n';
@@ -198,6 +199,7 @@
       $('runBox').style.display = 'none';
       toast(error.message, 'err');
     } finally {
+      $('runBox').classList.remove('active');
       $('goBtn').disabled = false;
       $('goText').textContent = '开始提取';
     }

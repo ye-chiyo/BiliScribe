@@ -5,6 +5,9 @@ const COOKIE_NAME = 'bs_auth';
 const QR_COOKIE = 'bs_qr';
 const MAX_URLS = 3;
 const MAX_PAGES = 8;
+const CONNECT_TIMEOUT_MS = 8000;
+const READ_TIMEOUT_MS = 12000;
+const TRANSIENT_RETRIES = 2;
 
 function json(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -74,16 +77,25 @@ function cookieHeader(cookies) {
 }
 
 async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
-  const response = await fetch(url, {
-    headers: { 'user-agent': UA, 'accept': 'application/json, text/plain, */*',
-      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      referer, ...(Object.keys(cookies).length ? { cookie: cookieHeader(cookies) } : {}) },
-    redirect: options.redirect || 'follow',
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok && !(options.redirect === 'manual' && [301, 302, 303, 307, 308].includes(response.status)))
-    throw new Error(`B站请求失败 (${response.status})`);
-  return response;
+  let lastError;
+  for (let attempt = 0; attempt <= TRANSIENT_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        headers: { 'user-agent': UA, 'accept': 'application/json, text/plain, */*',
+          'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          referer, ...(Object.keys(cookies).length ? { cookie: cookieHeader(cookies) } : {}) },
+        redirect: options.redirect || 'follow',
+        signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+      });
+      if (!response.ok && !(options.redirect === 'manual' && [301, 302, 303, 307, 308].includes(response.status)))
+        throw new Error(`B站请求失败 (${response.status})`);
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt < TRANSIENT_RETRIES) await new Promise(resolve => setTimeout(resolve, 400 * (2 ** attempt)));
+    }
+  }
+  throw lastError;
 }
 
 async function biliJson(url, cookies = {}, referer = ORIGIN) {
