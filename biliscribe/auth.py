@@ -61,6 +61,10 @@ def login_status() -> dict:
     cred = load_credentials()
     if not cred:
         return {"logged_in": False, "uname": "", "expires": None}
+    if cred.get("expires") and float(cred["expires"]) <= time.time():
+        return {"logged_in": False, "expired": True, "uname": "",
+                "saved_uname": cred.get("uname", ""),
+                "expires": cred.get("expires")}
     with get_client() as c:
         nav = c.nav()
     if nav.get("isLogin") is None:

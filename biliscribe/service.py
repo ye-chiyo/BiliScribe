@@ -189,7 +189,8 @@ class JobManager:
             with get_client() as client:
                 nav = client.nav()
                 if nav.get("isLogin") is False:
-                    self._log(job, "未登录: 游客无法获取字幕, 请先扫码登录")
+                    reason = "登录凭证已过期" if nav.get("expired") else "未登录"
+                    self._log(job, f"{reason}: 游客无法获取字幕, 请先扫码登录")
                     job["status"] = "need_login"
                     return
                 if nav.get("isLogin") is None:

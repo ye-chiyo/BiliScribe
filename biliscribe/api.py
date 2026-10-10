@@ -114,7 +114,15 @@ def parse_video_url(url: str) -> tuple[str | None, int | None, int | None]:
 
 class BiliClient:
     def __init__(self, cookies: dict | None = None, setup_fingerprint: bool = True):
-        self.client = httpx.Client(
+        self._cookies = dict(cookies or {})
+        self.client = self._new_client()
+        self._primed: set[str] = set()
+        if setup_fingerprint:
+            self._setup_fingerprint()
+        self._apply_cookies()
+
+    def _new_client(self) -> httpx.Client:
+        return httpx.Client(
             headers={"User-Agent": UA,
                      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                      "Accept": "application/json, text/plain, */*"},
@@ -122,11 +130,15 @@ class BiliClient:
             timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT,
                                    write=CONNECT_TIMEOUT, pool=CONNECT_TIMEOUT),
         )
-        self._primed: set[str] = set()
-        if setup_fingerprint:
-            self._setup_fingerprint()
-        for name, value in (cookies or {}).items():
+    def _apply_cookies(self):
+        for name, value in self._cookies.items():
             self.client.cookies.set(name, value, domain=".bilibili.com", path="/")
+
+    def _reconnect(self):
+        self._cookies.update(self.cookies_dict())
+        self.client.close()
+        self.client = self._new_client()
+        self._apply_cookies()
 
     def prime_video_page(self, bvid: str | None, aid: int | None, force: bool = False):
         """模拟浏览器先打开视频页(HTML): 服务端借此完成会话关联/补种 cookie,
@@ -185,6 +197,8 @@ class BiliClient:
                 return d.get("data", {})
             except (httpx.HTTPError, ValueError) as e:
                 last_exc = e
+                if isinstance(e, httpx.HTTPError):
+                    self._reconnect()
                 if attempt < min(retries, TRANSIENT_RETRIES):
                     time.sleep(0.5 * (2 ** attempt))
         raise BiliError(-1, f"请求失败: {last_exc}")
@@ -311,6 +325,7 @@ class BiliClient:
                 body = r.json().get("body", []) or []
                 break
             except (httpx.HTTPError, ValueError):
+                self._reconnect()
                 if attempt == 2:
                     body = []
                 if attempt < TRANSIENT_RETRIES:

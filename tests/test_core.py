@@ -172,6 +172,20 @@ def test_default_markdown_chinese():
         assert queued[2] == ["md"] and queued[4] == ["zh"]
 
 
+def test_expired_credentials_are_reported():
+    import tempfile
+    import time
+    import biliscribe.auth as auth
+    old_file = auth.CRED_FILE
+    with tempfile.TemporaryDirectory() as temp:
+        auth.CRED_FILE = Path(temp) / "cookies.json"
+        auth.CRED_FILE.write_text('{"cookies": {}, "uname": "old", "expires": 1}', encoding="utf-8")
+        status = auth.login_status()
+        assert status["expired"] is True
+        assert status["logged_in"] is False
+    auth.CRED_FILE = old_file
+
+
 def test_pages_spec_garbage():
     assert parse_pages_spec("1,a,3,xx", 5) == [1, 3]
     assert parse_pages_spec("a-b,2", 5) == [2]
