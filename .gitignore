@@ -1,0 +1,35 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local credentials and runtime cache
+data/cookies.json
+data/cache/
+data/*.tmp
+data/qr_login.png
+
+# User-generated subtitle exports
+output/
+
+# Nested checkout and repository metadata
+github-checkout/
+site/.git/
+
+# Site build and dependency files
+site/node_modules/
+site/.npm-cache/
+site/dist/
+site/.sites-runtime/
+site/.sites-checkout/
+site/*.tar.gz
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+.preview/
