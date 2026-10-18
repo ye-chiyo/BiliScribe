@@ -39,6 +39,8 @@ test('QR login and Chinese Markdown extraction', async () => {
     if (value.includes('/x/player/v2?')) return responseJson({ code: 0, data: {
       subtitle: { subtitles: [{ lan: 'ai-zh', lan_doc: '中文',
         subtitle_url: '//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/123456abcdef' },
+      { lan: 'ai-zh', lan_doc: '中文',
+        subtitle_url: '//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/123456abcdef' },
       { lan: 'ai-en', lan_doc: 'English',
         subtitle_url: '//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/abcdef' }] },
     } });
@@ -64,7 +66,7 @@ test('QR login and Chinese Markdown extraction', async () => {
 
     const extracted = await worker.fetch(request('/api/extract', {
       method: 'POST', headers: { origin, cookie: session, 'content-type': 'application/json' },
-      body: JSON.stringify({ urls: 'https://www.bilibili.com/video/BV11gYd6UEPv/' }),
+      body: JSON.stringify({ urls: 'https://www.bilibili.com/video/BV11gYd6UEPv/', langs: [' zh '] }),
     }), env);
     assert.equal(extracted.status, 200);
     const result = (await extracted.json()).results[0];

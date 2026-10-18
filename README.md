@@ -1,13 +1,13 @@
 # BiliScribe · B站视频字幕本地提取工具
 
 粘贴一个 B 站视频链接，提取其中文/英文 CC 或 AI 字幕，导出为 **SRT / VTT / TXT / JSON / Markdown**。
-纯本地运行，登录凭证只保存在你自己的电脑上（无数据库、无云端）。
+本地版在电脑上运行，登录凭证保存在项目 `data/cookies.json`；工具提取 B 站已经提供的 CC/AI 字幕，**不包含 ASR 语音识别**。
 
 当前版本：**v0.3.1**（深色影院风网页控制台 · 字幕归属校验）
 
 ## 云端版本
 
-私有 Sites 站点：[BiliScribe Cloud](https://biliscribe-cloud.shatancool1981.chatgpt.site)。云端版源代码在 [`site/`](site/)；首次使用需要在云端页面重新扫码登录，不会上传本机 `data/cookies.json`。导出文件直接在浏览器下载，云端不永久保存字幕。每次最多处理 3 个链接、单视频 8 个分 P；本地版仍适合更大的批量任务。
+私有 Sites 站点：[BiliScribe Cloud](https://biliscribe-cloud.shatancool1981.chatgpt.site)。云端版源代码在 [`site/`](site/)；它是原生 JavaScript Worker/Sites，不读取本机 `data/cookies.json`，首次使用需单独扫码登录。凭证加密后保存在浏览器的 HttpOnly、Secure、SameSite 会话 Cookie 中；字幕最多在 Worker 实例内存缓存 24 小时，实例回收即清除，导出由浏览器下载且不会永久保存。云端每次最多处理 3 个链接、单视频 8 个分 P；本地版适合更大的批量任务。
 
 ## 功能
 
@@ -18,7 +18,7 @@
 - 默认导出 Markdown 笔记；也可选择 SRT（带时间轴，可挂字幕播放）、VTT、纯文本 TXT、原始 JSON
 - 本地网页控制台（浏览器操作）+ 命令行两种用法
 - 作业**串行队列**：多个提取任务自动排队，避免并发触发 B 站限流
-- 自动限速、设备指纹预热、退避重试与 24 小时本地缓存，礼貌访问
+- 自动限速、设备指纹预热、有限退避重试与 24 小时本地缓存；缓存按视频/资源隔离，并在缓存和导出前验证字幕归属
 - 8765 端口被占用时自动向后寻找可用端口
 
 ## 快速开始（Windows）
@@ -31,6 +31,27 @@
 5. 粘贴视频链接 → 选择格式与语言 →「开始提取」，完成后可直接下载或点「打开文件夹」
 
 关闭黑色命令行窗口即停止服务；下次使用再双击 `启动.bat` 即可。
+
+## 开发与测试
+
+本地版使用 Python 3.10+、FastAPI、Uvicorn、httpx 和 qrcode；云端版使用原生 JavaScript Worker/Sites 与 Node.js 内置测试运行器。当前保留同步 `httpx.Client`，连接在单个串行作业中复用；队列和请求间隔用于控制 B 站访问频率，批量任务的实际速度受网络、字幕轨数和服务端限流影响。
+
+```powershell
+# Python 离线回归，不需要 pytest，也不访问 B站
+.\.venv\Scripts\python.exe -m unittest tests.test_offline_maintenance
+.\.venv\Scripts\python.exe tests\test_subtitle_guard.py
+.\.venv\Scripts\python.exe -m compileall -q biliscribe
+.\.venv\Scripts\python.exe tests\benchmark_mock.py
+
+# 云端构建与 mock 测试
+cd site
+npm test
+npm run build
+```
+
+`tests/test_web.py`、`tests/test_web_extract.py` 和 `tests/test_web_extras.py` 是面向已启动本地网页服务的手工端到端脚本；前两者需要真实登录或 B 站访问，不属于自动化测试。自动化回归和基准使用 mock。
+
+本地缓存位于 `data/cache/`，默认有效 24 小时；失效文件在本地服务启动时清理。登录凭证位于 `data/cookies.json`，通过临时文件原子替换保存，登出时删除。`data/` 与 `output/` 均为本地运行数据，不应提交或分享；日志不会记录 Cookie 值。
 
 ## 命令行用法
 
@@ -102,7 +123,7 @@ BiliScribe/
 - **提示未登录 / 字幕为空？** B 站字幕接口必须登录，游客拿不到字幕列表；请先扫码登录。
 - **顶栏显示「网络异常，登录态未校验」？** 断网时无法联网校验凭证，本地凭证仍在；网络恢复后刷新页面即可。
 - **二维码失效？** 二维码 180 秒有效，失效后点弹层中的「重新获取二维码」即可；重复点扫码会自动释放上一个二维码会话。
-- **视频提示「无所选语言的 CC/AI 字幕」？** 可能是视频没有该语言字幕，也可能是接口临时限流返回空列表；可稍后重试。后续版本计划加入本地语音转写（ASR）兜底。
+- **视频提示「无所选语言的 CC/AI 字幕」？** 可能是视频没有该语言字幕，也可能是接口临时限流返回空列表；可稍后重试。本项目当前不包含 ASR 语音转写。
 - **网页上明明有字幕，软件却偶尔提示无字幕？** 短时间高频请求会触发 B 站临时限流（字幕列表概率性返回空）。软件已内置设备指纹、视频页预热、退避重试与 24 小时本地缓存；遇到时等几分钟再试即可，成功提取过的视频再次导出走缓存、不再请求接口。
 - **提示「字幕接口多次返回其他视频的数据」？** B 站接口偶发把别的视频字幕轨返回给当前视频（v0.3.1 起会自动识别并重试）。若多次重试仍失败，等几分钟再提取即可；该提示意味着本次没有写入任何字幕文件，不会产生内容错误的文件。
 - **支持哪些字幕语言？** 视频提供几种语言就可导出几种（实测可同时拿到中、英、西、葡等 AI 翻译轨）；语言代码按词缀匹配，如 `zh` 同时命中 `ai-zh` 与 `zh-CN`。

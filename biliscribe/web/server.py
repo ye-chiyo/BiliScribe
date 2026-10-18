@@ -55,7 +55,11 @@ def create_app() -> FastAPI:
             except Exception:
                 pass
         qr = QRLogin()
-        _, data_url = qr.generate()
+        try:
+            _, data_url = qr.generate()
+        except Exception:
+            qr.close()
+            raise
         login_session["qr"] = qr
         return {"qr": data_url}
 

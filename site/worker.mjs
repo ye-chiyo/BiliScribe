@@ -8,6 +8,12 @@ const MAX_PAGES = 8;
 const CONNECT_TIMEOUT_MS = 8000;
 const READ_TIMEOUT_MS = 12000;
 const TRANSIENT_RETRIES = 2;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 500;
+const CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const subtitleCache = new Map();
+let cacheBytes = 0;
+let biliRequestTail = Promise.resolve();
 
 function json(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -79,7 +85,13 @@ function cookieHeader(cookies) {
 async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
   let lastError;
   for (let attempt = 0; attempt <= TRANSIENT_RETRIES; attempt += 1) {
+    let release;
     try {
+      const turn = new Promise(resolve => { release = resolve; });
+      const previous = biliRequestTail;
+      biliRequestTail = previous.then(() => turn);
+      await previous;
+      await new Promise(resolve => setTimeout(resolve, 150));
       const response = await fetch(url, {
         headers: { 'user-agent': UA, 'accept': 'application/json, text/plain, */*',
           'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -87,10 +99,12 @@ async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
         redirect: options.redirect || 'follow',
         signal: AbortSignal.timeout(READ_TIMEOUT_MS),
       });
+      release();
       if (!response.ok && !(options.redirect === 'manual' && [301, 302, 303, 307, 308].includes(response.status)))
         throw new Error(`B站请求失败 (${response.status})`);
       return response;
     } catch (error) {
+      if (typeof release === 'function') release();
       lastError = error;
       if (attempt < TRANSIENT_RETRIES) await new Promise(resolve => setTimeout(resolve, 400 * (2 ** attempt)));
     }
@@ -192,6 +206,50 @@ function resourceId(url) {
   return String(url || '').split('/prod/').pop().split('?')[0];
 }
 
+function cacheRead(key) {
+  const item = subtitleCache.get(key);
+  if (!item || Date.now() - item.savedAt >= CACHE_TTL_MS) {
+    if (item) cacheBytes -= item.bytes;
+    subtitleCache.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function cacheWrite(key, value) {
+  const encoded = JSON.stringify(value);
+  const bytes = new TextEncoder().encode(encoded).byteLength;
+  if (bytes > CACHE_MAX_BYTES) return;
+  const previous = subtitleCache.get(key);
+  if (previous) cacheBytes -= previous.bytes;
+  while (subtitleCache.size >= CACHE_MAX_ENTRIES || cacheBytes + bytes > CACHE_MAX_BYTES) {
+    const oldest = subtitleCache.keys().next().value;
+    if (oldest === undefined) break;
+    cacheBytes -= subtitleCache.get(oldest).bytes;
+    subtitleCache.delete(oldest);
+  }
+  subtitleCache.set(key, { savedAt: Date.now(), value, bytes });
+  cacheBytes += bytes;
+}
+
+function uniqueTracks(tracks) {
+  const seen = new Set();
+  return tracks.filter(track => {
+    const key = resourceId(track.subtitle_url) || `${track.lan || ''}:${track.lan_doc || ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function languageMatches(value, wanted) {
+  const lan = String(value || '').toLowerCase();
+  return wanted.some(lang => {
+    const item = String(lang || '').trim().toLowerCase();
+    return lan === item || lan.split(/[-_]/).includes(item);
+  });
+}
+
 function belongs(track, aid, cid) {
   const id = resourceId(track.subtitle_url);
   if (!id) return false;
@@ -202,6 +260,9 @@ function belongs(track, aid, cid) {
 
 async function subtitleTracks(bvid, aid, cid, cookies) {
   const referer = `https://www.bilibili.com/video/${bvid}`;
+  const cacheKey = `tracks:${bvid}:${aid}:${cid}`;
+  const cached = cacheRead(cacheKey);
+  if (cached && cached.every(track => belongs(track, aid, cid))) return cached;
   let sawForeign = false;
   for (const delay of [0, 2000, 5000]) {
     if (delay) await new Promise(resolve => setTimeout(resolve, delay));
@@ -209,9 +270,13 @@ async function subtitleTracks(bvid, aid, cid, cookies) {
       cookies, referer);
     const tracks = data.subtitle?.subtitles || [];
     if (!tracks.length) continue;
-    const good = tracks.filter(track => belongs(track, aid, cid));
-    sawForeign ||= good.length !== tracks.length;
-    if (good.length && good.length === tracks.length) return good;
+    const owned = tracks.filter(track => belongs(track, aid, cid));
+    const good = uniqueTracks(owned);
+    sawForeign ||= owned.length !== tracks.length;
+    if (owned.length && owned.length === tracks.length) {
+      cacheWrite(cacheKey, good);
+      return good;
+    }
   }
   if (sawForeign) throw new Error('字幕接口多次返回其他视频的字幕轨，请稍后重试');
   return [];
@@ -236,10 +301,15 @@ async function subtitleBody(url, bvid, cookies) {
   if (absolute.protocol !== 'https:' ||
       !(absolute.hostname.endsWith('.hdslb.com') || absolute.hostname.endsWith('.bilibili.com')))
     throw new Error('字幕资源地址不受支持');
+  const key = `body:${resourceId(absolute.href)}`;
+  const cached = cacheRead(key);
+  if (cached) return cached;
   const response = await biliGet(absolute.href, cookies,
     `https://www.bilibili.com/video/${bvid}`);
   const data = await response.json();
-  return Array.isArray(data.body) ? data.body : [];
+  const body = Array.isArray(data.body) ? data.body : [];
+  if (body.length) cacheWrite(key, body);
+  return body;
 }
 
 function safeName(value, max = 60) {
@@ -294,8 +364,8 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
   for (const pageNumber of pages) {
     const page = info.pages.find(item => item.page === pageNumber);
     let tracks = await subtitleTracks(info.bvid, info.aid, page.cid, cookies);
-    if (!langs.includes('all')) tracks = tracks.filter(track =>
-      langs.some(lang => String(track.lan || '').toLowerCase().split(/[-_]/).includes(lang)));
+    if (!langs.some(lang => String(lang).trim().toLowerCase() === 'all'))
+      tracks = tracks.filter(track => languageMatches(track.lan, langs));
     if (!tracks.length) result.no_subtitle_pages.push(pageNumber);
     for (const track of tracks) {
       const body = await subtitleBody(track.subtitle_url, info.bvid, cookies);

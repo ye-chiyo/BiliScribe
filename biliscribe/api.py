@@ -22,6 +22,27 @@ CONNECT_TIMEOUT = 8.0
 READ_TIMEOUT = 12.0
 TRANSIENT_RETRIES = 2
 
+
+def _atomic_json_write(path: Path, value) -> None:
+    """Write cache data atomically so a killed process cannot leave JSON half-written."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _cache_fresh(path: Path, ttl: int = CACHE_TTL) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < ttl
+    except OSError:
+        return False
+
 def cleanup_cache(max_age: int = CACHE_TTL) -> int:
     """删除超过 TTL 的缓存文件, 返回清理数量。服务启动时调用一次。"""
     removed = 0
@@ -62,6 +83,11 @@ def subtitle_resource_id(subtitle_url: str) -> str:
     """从字幕 URL 中提取 /prod/ 后的资源 id(去掉 auth_key 等 query)。"""
     tail = subtitle_url.split("/prod/")[-1]
     return tail.split("?")[0]
+
+
+def _track_key(track: dict) -> str:
+    """Return a stable, non-secret identity for a subtitle resource."""
+    return subtitle_resource_id(str(track.get("subtitle_url", "")))
 
 
 def track_belongs_to_video(track: dict, aid: int | None, cid: int) -> bool:
@@ -117,6 +143,7 @@ class BiliClient:
         self._cookies = dict(cookies or {})
         self.client = self._new_client()
         self._primed: set[str] = set()
+        self._video_info_cache: dict[str, dict] = {}
         if setup_fingerprint:
             self._setup_fingerprint()
         self._apply_cookies()
@@ -214,8 +241,10 @@ class BiliClient:
     # ---------- 视频与字幕 ----------
     def get_video_info(self, bvid: str | None = None, aid: int | None = None) -> dict:
         key = f"bvid={bvid}" if bvid else f"aid={aid}"
+        if key in self._video_info_cache:
+            return self._video_info_cache[key]
         d = self._get_json(f"https://api.bilibili.com/x/web-interface/view?{key}")
-        return {
+        info = {
             "bvid": d["bvid"], "aid": d["aid"], "cid": d["cid"],
             "title": d["title"], "owner": d["owner"]["name"],
             "duration": d["duration"], "tname": d.get("tname", ""),
@@ -223,6 +252,10 @@ class BiliClient:
             "pages": [{"page": p["page"], "cid": p["cid"], "part": p["part"],
                        "duration": p["duration"]} for p in d["pages"]],
         }
+        self._video_info_cache[key] = info
+        self._video_info_cache.setdefault(f"bvid={info['bvid']}", info)
+        self._video_info_cache.setdefault(f"aid={info['aid']}", info)
+        return info
 
     def get_subtitle_list(self, bvid: str | None, aid: int | None, cid: int,
                           on_log=None) -> list[dict]:
@@ -236,16 +269,26 @@ class BiliClient:
             if on_log:
                 on_log(m)
 
-        cf = CACHE_DIR / f"{cid}_list.json"
-        if cf.exists() and time.time() - cf.stat().st_mtime < CACHE_TTL:
+        # Include the video identity in the cache key.  A CID is not a global
+        # identifier and can otherwise collide with another video's page.
+        cache_key = hashlib.sha256(
+            f"{bvid or ''}:{aid or ''}:{cid}".encode("utf-8")
+        ).hexdigest()[:24]
+        cf = CACHE_DIR / f"{cache_key}_list.json"
+        # Do not read the legacy CID-only key: it cannot distinguish videos
+        # when a resource id is opaque, so using it could return another
+        # video's subtitle. Existing legacy files expire through normal cleanup.
+        if _cache_fresh(cf):
             try:
                 cached = json.loads(cf.read_text(encoding="utf-8"))
-                if cached and all(track_belongs_to_video(t, aid, cid) for t in cached):
-                    return cached
+                if (isinstance(cached, list) and cached
+                        and all(track_belongs_to_video(t, aid, cid) for t in cached)):
+                    unique = { _track_key(t): t for t in cached if _track_key(t) }
+                    return list(unique.values())
                 log("本地字幕缓存校验未通过(疑似其他视频数据), 重新拉取")
-                cf.unlink()
+                cf.unlink(missing_ok=True)
             except (json.JSONDecodeError, OSError):
-                pass
+                cf.unlink(missing_ok=True)
 
         if not bvid:
             # view 接口对 av 号也会返回规范 bvid; 没有 bvid 就无法安全查询
@@ -278,18 +321,17 @@ class BiliClient:
                 log(f"字幕接口返回了其他视频的字幕轨, 正在重试"
                     f"({rnd + 1}/{len(waits)})")
             for t in good:
-                partial.setdefault(t.get("lan", str(len(partial))), t)
+                partial.setdefault(_track_key(t) or t.get("lan", str(len(partial))), t)
             if good and bad == 0:
-                CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                cf.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
-                return good
+                unique = list(partial.values())
+                _atomic_json_write(cf, unique)
+                return unique
 
         if partial:
             # 多轮中至少有部分轨(如中文轨)通过校验: 用并集兜底, 不丢可用结果
             log("部分字幕轨多次重试仍未通过归属校验, 仅导出校验通过的轨")
             merged = list(partial.values())
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            cf.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+            _atomic_json_write(cf, merged)
             return merged
         if not saw_foreign_track:
             return []
@@ -298,12 +340,17 @@ class BiliClient:
     def fetch_subtitle(self, subtitle_url: str, bvid: str) -> list[dict]:
         if subtitle_url.startswith("//"):
             subtitle_url = "https:" + subtitle_url
+        parsed = httpx.URL(subtitle_url)
+        if parsed.scheme != "https" or not (
+                parsed.host == "bilibili.com" or parsed.host.endswith(".bilibili.com")
+                or parsed.host == "hdslb.com" or parsed.host.endswith(".hdslb.com")):
+            raise BiliError(-1, "字幕资源地址不受支持")
         # 缓存键用稳定资源 id(含 aid+cid 归属段), 不含时效 auth_key:
         # 既避免同轨反复下载, 又天然隔离不同视频
         rid = subtitle_resource_id(subtitle_url)
         h = hashlib.md5(rid.encode()).hexdigest()[:16]
         cf = CACHE_DIR / f"{h}_body.json"
-        if cf.exists() and time.time() - cf.stat().st_mtime < CACHE_TTL:
+        if _cache_fresh(cf):
             try:
                 return json.loads(cf.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -312,6 +359,7 @@ class BiliClient:
         # 不能走 _get_json, 需直接解析
         referer = f"https://www.bilibili.com/video/{bvid}"
         body: list[dict] = []
+        body_ok = False
         for attempt in range(TRANSIENT_RETRIES + 1):
             try:
                 r = self.client.get(subtitle_url, headers={"Referer": referer})
@@ -324,6 +372,7 @@ class BiliClient:
                     continue
                 r.raise_for_status()
                 body = r.json().get("body", []) or []
+                body_ok = True
                 break
             except (httpx.HTTPError, ValueError):
                 self._reconnect()
@@ -331,9 +380,10 @@ class BiliClient:
                     body = []
                 if attempt < TRANSIENT_RETRIES:
                     time.sleep(0.5 * (2 ** attempt))
-        if body:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            cf.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        # Empty but successful responses are cached too; failed requests are
+        # left uncached so a transient outage can recover on the next attempt.
+        if body_ok:
+            _atomic_json_write(cf, body)
         return body
 
     def nav(self) -> dict:

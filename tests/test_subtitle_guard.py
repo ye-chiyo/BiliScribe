@@ -2,6 +2,7 @@
 """回归: B 站 player/v2 概率返回其他视频字幕轨的归属校验与重试。
 纯离线, 可直接 `python tests/test_subtitle_guard.py` 运行。"""
 import json
+import hashlib
 import sys
 import tempfile
 import time
@@ -86,7 +87,8 @@ def test_retry_until_owned():
         assert all("_ts=" in u for u in h.calls), h.calls
         assert any("其他视频" in m for m in logs)
         # 缓存落盘且为校验通过的结果
-        cf = Path(h.tmp.name) / f"{CID}_list.json"
+        cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
+        cf = Path(h.tmp.name) / f"{cache_key}_list.json"
         assert cf.exists()
         cached = json.loads(cf.read_text(encoding="utf-8"))
         assert all(track_belongs_to_video(x, AID, CID) for x in cached)
@@ -107,7 +109,8 @@ def test_all_rounds_bad_raises():
         assert raised
         assert len(h.calls) == 3
         # 全部失败时不得写缓存
-        assert not (Path(h.tmp.name) / f"{CID}_list.json").exists()
+        cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
+        assert not (Path(h.tmp.name) / f"{cache_key}_list.json").exists()
     finally:
         h.close()
     print("[PASS] 连续串轨时明确报错, 绝不导出错误字幕")
@@ -117,7 +120,8 @@ def test_dirty_cache_discarded():
     h = _Harness([v2_data(t(ZH_GOOD), t(EN_GOOD, "ai-en", "English"))])
     try:
         # 预置旧版本写入的脏缓存
-        cf = Path(h.tmp.name) / f"{CID}_list.json"
+        cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
+        cf = Path(h.tmp.name) / f"{cache_key}_list.json"
         cf.write_text(json.dumps([t(ZH_BAD)]), encoding="utf-8")
         tracks = h.client.get_subtitle_list(BVID, AID, CID)
         assert {x["subtitle_url"] for x in tracks} == {ZH_GOOD, EN_GOOD}
