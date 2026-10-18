@@ -254,6 +254,8 @@ function belongs(track, aid, cid) {
   const id = resourceId(track.subtitle_url);
   if (!id) return false;
   const prefix = `${aid}${cid}`;
+  const lan = String(track.lan || '').toLowerCase();
+  if (/(^|[-_])zh([-_]|$)/.test(lan)) return id.startsWith(prefix);
   const head = id.slice(0, prefix.length);
   return !/^\d+$/.test(head) || head === prefix;
 }

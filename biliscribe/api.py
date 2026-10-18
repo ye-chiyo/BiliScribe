@@ -102,6 +102,12 @@ def track_belongs_to_video(track: dict, aid: int | None, cid: int) -> bool:
         return False
     if aid:
         prefix = f"{aid}{cid}"
+        lan = str(track.get("lan", "")).lower()
+        if re.search(r"(?:^|[-_])zh(?:[-_]|$)", lan):
+            # Chinese CC/AI resources carry the owning aid+cid prefix. An
+            # opaque or mismatched Chinese id is unsafe to export because
+            # player/v2 can return another video's track for this request.
+            return rid.startswith(prefix)
         head = rid[: len(prefix)]
         if head.isdigit():
             # 带数字归属段的资源 id: 必须严格等于本视频 aid+cid

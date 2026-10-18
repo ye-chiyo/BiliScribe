@@ -19,6 +19,7 @@ BVID = "BV1V3Yn6wENr"
 ZH_GOOD = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/" + f"{AID}{CID}" + "e16daccabd23056845eff8887d2793e0?auth_key=aaa"
 ZH_BAD = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/11337329541521726472939880a6877ed40000000000000000000000?auth_key=bbb"
 EN_GOOD = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/3edf4c2f0f19b96ccd9259f653d571a7?auth_key=ccc"
+ZH_FOREIGN_OPAQUE = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/160542018915680499092528a97cdc69a1be6c94eaf5e5021780?auth_key=ddd"
 
 
 def t(url, lan="ai-zh", doc="中文"):
@@ -36,6 +37,11 @@ def test_track_owner_check():
     assert track_belongs_to_video(t(""), AID, CID) is False
     # 无 aid 无法校验, 放行(不应误杀)
     assert track_belongs_to_video(t(ZH_BAD), None, CID) is True
+
+
+def test_chinese_track_with_mismatched_numeric_prefix_is_rejected():
+    # 中文 AI 轨通常编码 aid+cid; 长数字前缀但不匹配时是串轨, 不能放行。
+    assert track_belongs_to_video(t(ZH_FOREIGN_OPAQUE), AID, CID) is False
 
 
 # ---------- get_subtitle_list 重试/缓存 ----------
