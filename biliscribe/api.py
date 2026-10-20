@@ -11,6 +11,7 @@ import json
 import random
 import re
 import time
+from urllib.parse import unquote_to_bytes, urlsplit, urlunsplit
 from pathlib import Path
 
 import httpx
@@ -21,6 +22,27 @@ CACHE_TTL = 24 * 3600  # 字幕缓存 24 小时, 避免重复请求触发频控
 CONNECT_TIMEOUT = 8.0
 READ_TIMEOUT = 12.0
 TRANSIENT_RETRIES = 2
+
+
+def _atomic_json_write(path: Path, value) -> None:
+    """Write cache data atomically so a killed process cannot leave JSON half-written."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _cache_fresh(path: Path, ttl: int = CACHE_TTL) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < ttl
+    except OSError:
+        return False
 
 def cleanup_cache(max_age: int = CACHE_TTL) -> int:
     """删除超过 TTL 的缓存文件, 返回清理数量。服务启动时调用一次。"""
@@ -50,6 +72,130 @@ PAGE_RE = re.compile(r"[?&]p=(\d+)")
 AUTH_ERRORS = {-101, -102, -111, -658}
 RATE_ERRORS = {-412, -352, -799, 88008}
 
+# The web player uses two rotating key pairs for subtitle_url_v2.  These are
+# path obfuscation keys, not credentials; the signed auth_key remains a query
+# parameter and is never logged or persisted separately.
+_SUBTITLE_V2_KEYS = (
+    (r'nP](wOFRvU.+<fjS{jn-!$D|Dz&",zT`',
+     r'=CFxYRn{.y|uVyO$uh&sikph?N.ilF/`bilibili'),
+    (r'Bn"q~|albg@]Go~ACgyDvKnd+)_D}^&J?',
+     r"Cu~L!xs~f^&r@'vh=q]q{eeng*sEg^kp#Jbilibili"),
+)
+
+
+def _decode_subtitle_v2_path(path: str) -> str:
+    """Decode the web player's percent-escaped XOR subtitle path."""
+    try:
+        encoded = path[1:] if path.startswith("/") else path
+        cipher = unquote_to_bytes(encoded)
+    except ValueError as exc:
+        raise BiliError(-1, "字幕资源地址编码无效") from exc
+    for prefix, key in _SUBTITLE_V2_KEYS:
+        plain = bytes(byte ^ ord(key[index % len(key)])
+                      for index, byte in enumerate(cipher))
+        prefix_bytes = prefix.encode("ascii")
+        if plain.startswith(prefix_bytes):
+            decoded = plain[len(prefix_bytes):].decode("utf-8")
+            if decoded.startswith("/bfs/"):
+                return decoded
+    raise BiliError(-1, "字幕资源地址无法解码")
+
+
+def normalize_subtitle_url(subtitle_url: str) -> str:
+    """Return a safe, directly downloadable subtitle JSON URL."""
+    raw = str(subtitle_url or "").strip()
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise BiliError(-1, "字幕资源地址不受支持") from exc
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme != "https" or parsed.username or parsed.password
+            or port not in (None, 443)
+            or not (host == "bilibili.com" or host.endswith(".bilibili.com")
+                    or host == "hdslb.com" or host.endswith(".hdslb.com"))):
+        raise BiliError(-1, "字幕资源地址不受支持")
+    if host == "subtitle.bilibili.com":
+        path = _decode_subtitle_v2_path(parsed.path)
+        return urlunsplit(("https", "aisubtitle.hdslb.com", path,
+                           parsed.query, ""))
+    return urlunsplit(("https", parsed.netloc, parsed.path,
+                       parsed.query, parsed.fragment))
+
+
+def _protobuf_varint(payload: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(payload):
+        byte = payload[offset]
+        offset += 1
+        value |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+        if shift > 63:
+            raise ValueError("protobuf varint is too long")
+    raise ValueError("unterminated protobuf varint")
+
+
+def _protobuf_fields(payload: bytes) -> list[tuple[int, int, int | bytes]]:
+    """Decode the wire types used by Bilibili's subtitle metadata response."""
+    fields = []
+    offset = 0
+    while offset < len(payload):
+        key, offset = _protobuf_varint(payload, offset)
+        number, wire_type = key >> 3, key & 7
+        if number <= 0:
+            raise ValueError("invalid protobuf field number")
+        if wire_type == 0:
+            value, offset = _protobuf_varint(payload, offset)
+            fields.append((number, wire_type, value))
+        elif wire_type in (1, 5):
+            size = 8 if wire_type == 1 else 4
+            end = offset + size
+            if end > len(payload):
+                raise ValueError("truncated protobuf fixed field")
+            fields.append((number, wire_type, payload[offset:end]))
+            offset = end
+        elif wire_type == 2:
+            length, offset = _protobuf_varint(payload, offset)
+            end = offset + length
+            if end > len(payload):
+                raise ValueError("truncated protobuf bytes field")
+            fields.append((number, wire_type, payload[offset:end]))
+            offset = end
+        else:
+            raise ValueError(f"unsupported protobuf wire type: {wire_type}")
+    return fields
+
+
+def parse_web_subtitle_response(payload: bytes) -> list[dict]:
+    """Parse the current ``/x/v2/subtitle/web/view`` metadata response."""
+    top = _protobuf_fields(payload)
+    data = next((v for n, w, v in top if n == 1 and w == 2), None)
+    if not isinstance(data, bytes):
+        return []
+    tracks = []
+    for number, wire_type, item in _protobuf_fields(data):
+        if number != 3 or wire_type != 2 or not isinstance(item, bytes):
+            continue
+        fields = _protobuf_fields(item)
+
+        def text(field_number: int) -> str | None:
+            value = next((v for n, w, v in fields
+                          if n == field_number and w == 2), None)
+            return value.decode("utf-8") if isinstance(value, bytes) else None
+
+        lan, subtitle_url = text(3), text(5)
+        if not lan or not subtitle_url:
+            continue
+        ident = next((v for n, w, v in fields if n == 1 and w == 0), None)
+        tracks.append({"id": ident, "id_str": text(2), "lan": lan,
+                       "lan_doc": text(4), "subtitle_url": subtitle_url})
+    return tracks
+
 
 class BiliError(Exception):
     def __init__(self, code: int, message: str):
@@ -59,9 +205,20 @@ class BiliError(Exception):
 
 
 def subtitle_resource_id(subtitle_url: str) -> str:
-    """从字幕 URL 中提取 /prod/ 后的资源 id(去掉 auth_key 等 query)。"""
-    tail = subtitle_url.split("/prod/")[-1]
+    """Return a stable resource id for legacy and encoded subtitle URLs."""
+    raw = str(subtitle_url or "")
+    try:
+        raw = normalize_subtitle_url(raw)
+    except BiliError:
+        pass
+    path = urlsplit(raw).path
+    tail = path.split("/prod/")[-1]
     return tail.split("?")[0]
+
+
+def _track_key(track: dict) -> str:
+    """Return a stable, non-secret identity for a subtitle resource."""
+    return subtitle_resource_id(str(track.get("subtitle_url", "")))
 
 
 def track_belongs_to_video(track: dict, aid: int | None, cid: int) -> bool:
@@ -76,6 +233,12 @@ def track_belongs_to_video(track: dict, aid: int | None, cid: int) -> bool:
         return False
     if aid:
         prefix = f"{aid}{cid}"
+        lan = str(track.get("lan", "")).lower()
+        if re.search(r"(?:^|[-_])zh(?:[-_]|$)", lan):
+            # Chinese CC/AI resources carry the owning aid+cid prefix. An
+            # opaque or mismatched Chinese id is unsafe to export because
+            # player/v2 can return another video's track for this request.
+            return rid.startswith(prefix)
         head = rid[: len(prefix)]
         if head.isdigit():
             # 带数字归属段的资源 id: 必须严格等于本视频 aid+cid
@@ -117,6 +280,7 @@ class BiliClient:
         self._cookies = dict(cookies or {})
         self.client = self._new_client()
         self._primed: set[str] = set()
+        self._video_info_cache: dict[str, dict] = {}
         if setup_fingerprint:
             self._setup_fingerprint()
         self._apply_cookies()
@@ -214,8 +378,10 @@ class BiliClient:
     # ---------- 视频与字幕 ----------
     def get_video_info(self, bvid: str | None = None, aid: int | None = None) -> dict:
         key = f"bvid={bvid}" if bvid else f"aid={aid}"
+        if key in self._video_info_cache:
+            return self._video_info_cache[key]
         d = self._get_json(f"https://api.bilibili.com/x/web-interface/view?{key}")
-        return {
+        info = {
             "bvid": d["bvid"], "aid": d["aid"], "cid": d["cid"],
             "title": d["title"], "owner": d["owner"]["name"],
             "duration": d["duration"], "tname": d.get("tname", ""),
@@ -223,9 +389,13 @@ class BiliClient:
             "pages": [{"page": p["page"], "cid": p["cid"], "part": p["part"],
                        "duration": p["duration"]} for p in d["pages"]],
         }
+        self._video_info_cache[key] = info
+        self._video_info_cache.setdefault(f"bvid={info['bvid']}", info)
+        self._video_info_cache.setdefault(f"aid={info['aid']}", info)
+        return info
 
     def get_subtitle_list(self, bvid: str | None, aid: int | None, cid: int,
-                          on_log=None) -> list[dict]:
+                          on_log=None, force_refresh: bool = False) -> list[dict]:
         """字幕列表对高频请求敏感(实测频控时会随机返回 0/1/2 条), 且 player/v2
         会概率性返回*其他视频*的字幕轨。策略:
         1. 只用 bvid 形式查询(aid 形式实测几乎必然串到其他视频, av 号链接在
@@ -236,16 +406,26 @@ class BiliClient:
             if on_log:
                 on_log(m)
 
-        cf = CACHE_DIR / f"{cid}_list.json"
-        if cf.exists() and time.time() - cf.stat().st_mtime < CACHE_TTL:
+        # Include the video identity in the cache key.  A CID is not a global
+        # identifier and can otherwise collide with another video's page.
+        cache_key = hashlib.sha256(
+            f"{bvid or ''}:{aid or ''}:{cid}".encode("utf-8")
+        ).hexdigest()[:24]
+        cf = CACHE_DIR / f"{cache_key}_list.json"
+        # Do not read the legacy CID-only key: it cannot distinguish videos
+        # when a resource id is opaque, so using it could return another
+        # video's subtitle. Existing legacy files expire through normal cleanup.
+        if not force_refresh and _cache_fresh(cf):
             try:
                 cached = json.loads(cf.read_text(encoding="utf-8"))
-                if cached and all(track_belongs_to_video(t, aid, cid) for t in cached):
-                    return cached
+                if (isinstance(cached, list) and cached
+                        and all(track_belongs_to_video(t, aid, cid) for t in cached)):
+                    unique = { _track_key(t): t for t in cached if _track_key(t) }
+                    return list(unique.values())
                 log("本地字幕缓存校验未通过(疑似其他视频数据), 重新拉取")
-                cf.unlink()
+                cf.unlink(missing_ok=True)
             except (json.JSONDecodeError, OSError):
-                pass
+                cf.unlink(missing_ok=True)
 
         if not bvid:
             # view 接口对 av 号也会返回规范 bvid; 没有 bvid 就无法安全查询
@@ -254,8 +434,29 @@ class BiliClient:
         # 实测: 必须先打开视频页完成会话关联, 否则字幕列表会被裁剪
         self.prime_video_page(bvid, aid)
 
-        # 给 player/v2 加短时唯一参数，避免 B 站/CDN 将错误的旧字幕列表持续缓存到同一键。
-        query = f"bvid={bvid}&cid={cid}&_ts={time.time_ns()}"
+        # 当前播放器对部分视频只通过 Protobuf 接口返回完整 AI 轨道。
+        # 仍须从解码后的资源 ID 校验 aid/cid, 通过后才进入缓存。
+        modern_was_empty = False
+        try:
+            modern = self._get_modern_subtitle_list(bvid, aid, cid)
+            modern_was_empty = not modern
+        except (BiliError, httpx.HTTPError, ValueError) as exc:
+            modern = []
+            log(f"现代字幕接口不可用, 回退旧接口: {exc}")
+        if modern:
+            verified = []
+            seen = set()
+            for track in modern:
+                key = _track_key(track)
+                if (key and key not in seen and track.get("lan")
+                        and track_belongs_to_video(track, aid, cid)):
+                    item = dict(track)
+                    verified.append(item)
+                    seen.add(key)
+            if verified:
+                _atomic_json_write(cf, verified)
+                return verified
+
         # 限流空列表 / 串轨都靠退避重试解决; 每轮重新预热视频页
         waits = [0, 1, 2]
         partial: dict[str, dict] = {}
@@ -265,6 +466,9 @@ class BiliClient:
                 time.sleep(w)
                 self.prime_video_page(bvid, aid, force=True)
             # 实测: 附加 web_location 参数会使字幕列表被裁剪, 用最简查询
+            # 每一轮必须生成新的缓存破坏参数; 复用同一 URL 会让 CDN
+            # 持续返回上一轮的错误字幕列表, 使重试失去意义。
+            query = f"bvid={bvid}&cid={cid}&_ts={time.time_ns()}-{rnd}"
             d = self._get_json(
                 f"https://api.bilibili.com/x/player/v2?{query}",
                 referer=f"https://www.bilibili.com/video/{bvid}")
@@ -278,34 +482,88 @@ class BiliClient:
                 log(f"字幕接口返回了其他视频的字幕轨, 正在重试"
                     f"({rnd + 1}/{len(waits)})")
             for t in good:
-                partial.setdefault(t.get("lan", str(len(partial))), t)
+                partial.setdefault(_track_key(t) or t.get("lan", str(len(partial))), t)
             if good and bad == 0:
-                CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                cf.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
-                return good
+                unique = list(partial.values())
+                _atomic_json_write(cf, unique)
+                return unique
 
         if partial:
             # 多轮中至少有部分轨(如中文轨)通过校验: 用并集兜底, 不丢可用结果
             log("部分字幕轨多次重试仍未通过归属校验, 仅导出校验通过的轨")
             merged = list(partial.values())
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            cf.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+            _atomic_json_write(cf, merged)
             return merged
+        if saw_foreign_track:
+            # 旧 player/v2 连续串轨时, 现代接口可能只是首轮被限流为空。
+            # 再刷新一次现代接口; 它以 aid+cid 查询, 可提供不依赖旧接口的正确轨道。
+            try:
+                modern = self._get_modern_subtitle_list(bvid, aid, cid)
+            except (BiliError, httpx.HTTPError, ValueError) as exc:
+                modern = []
+                log(f"现代字幕接口刷新失败: {exc}")
+            verified = []
+            seen = set()
+            for track in modern:
+                key = _track_key(track)
+                if (key and key not in seen and track.get("lan")
+                        and track_belongs_to_video(track, aid, cid)):
+                    item = dict(track)
+                    verified.append(item)
+                    seen.add(key)
+            if verified:
+                _atomic_json_write(cf, verified)
+                log("旧接口持续串轨, 已通过现代字幕接口恢复")
+                return verified
         if not saw_foreign_track:
             return []
+        if modern_was_empty:
+            raise BiliError(
+                -1,
+                "未找到属于当前视频的可用字幕轨; 旧接口返回的字幕属于其他视频, "
+                "请确认播放器确实显示 CC/AI 字幕后再重试",
+            )
         raise BiliError(-1, "字幕接口多次返回其他视频的数据, 请稍后重试")
 
+    def invalidate_subtitle_cache(self, bvid: str | None, aid: int | None,
+                                  cid: int) -> None:
+        """Discard cached subtitle URLs so a later request gets fresh signatures."""
+        key = hashlib.sha256(
+            f"{bvid or ''}:{aid or ''}:{cid}".encode("utf-8")
+        ).hexdigest()[:24]
+        (CACHE_DIR / f"{key}_list.json").unlink(missing_ok=True)
+
+    def _get_modern_subtitle_list(self, bvid: str, aid: int | None,
+                                  cid: int) -> list[dict]:
+        if not aid:
+            return []
+        response = self.client.get(
+            "https://api.bilibili.com/x/v2/subtitle/web/view",
+            params={"oid": cid, "pid": aid,
+                    "context_ext": '{"video_type":1}', "type": 1,
+                    "cur_production_type": 0, "playlist_switch": 0,
+                    "arc_video_language": "cmn", "preferred_language": "ai-zh",
+                    "web_location": 1315873},
+            headers={"Referer": f"https://www.bilibili.com/video/{bvid}",
+                     "Accept": "application/octet-stream"})
+        response.raise_for_status()
+        return parse_web_subtitle_response(response.content)
+
     def fetch_subtitle(self, subtitle_url: str, bvid: str) -> list[dict]:
-        if subtitle_url.startswith("//"):
-            subtitle_url = "https:" + subtitle_url
+        subtitle_url = normalize_subtitle_url(subtitle_url)
         # 缓存键用稳定资源 id(含 aid+cid 归属段), 不含时效 auth_key:
         # 既避免同轨反复下载, 又天然隔离不同视频
         rid = subtitle_resource_id(subtitle_url)
         h = hashlib.md5(rid.encode()).hexdigest()[:16]
         cf = CACHE_DIR / f"{h}_body.json"
-        if cf.exists() and time.time() - cf.stat().st_mtime < CACHE_TTL:
+        if _cache_fresh(cf):
             try:
-                return json.loads(cf.read_text(encoding="utf-8"))
+                cached = json.loads(cf.read_text(encoding="utf-8"))
+                if cached:
+                    return cached
+                # 旧版本可能已经把临时空正文写入缓存; 读到后立即清除,
+                # 避免升级后仍被 24 小时空缓存锁死。
+                cf.unlink(missing_ok=True)
             except (json.JSONDecodeError, OSError):
                 pass
         # 注意: aisubtitle 字幕 JSON 没有 api.bilibili.com 的 {code,data} 包裹,
@@ -324,6 +582,13 @@ class BiliClient:
                     continue
                 r.raise_for_status()
                 body = r.json().get("body", []) or []
+                if body:
+                    break
+                # 200 + 空正文可能是字幕 CDN 的临时空响应; 不把它缓存,
+                # 也给本次调用一个机会等到正文恢复。
+                if attempt < TRANSIENT_RETRIES:
+                    time.sleep(0.5 * (2 ** attempt))
+                    continue
                 break
             except (httpx.HTTPError, ValueError):
                 self._reconnect()
@@ -331,9 +596,9 @@ class BiliClient:
                     body = []
                 if attempt < TRANSIENT_RETRIES:
                     time.sleep(0.5 * (2 ** attempt))
+        # 只有实际拿到正文才缓存; 空响应必须允许下一次提取重新请求。
         if body:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            cf.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+            _atomic_json_write(cf, body)
         return body
 
     def nav(self) -> dict:

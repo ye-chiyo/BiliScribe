@@ -18,6 +18,10 @@ output/
 github-checkout/
 site/.git/
 
+# Local investigation and browser automation artifacts
+.tmp/
+.playwright-cli/
+
 # Site build and dependency files
 site/node_modules/
 site/.npm-cache/

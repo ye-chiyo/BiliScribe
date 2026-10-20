@@ -87,6 +87,7 @@ def test_pick_tracks_lang_family():
     assert len(_pick_tracks(tracks, ["all"])) == 4
     # 指定语言不存在时不得导出其他语言
     assert _pick_tracks(tracks, ["ja"]) == []
+    assert _pick_tracks([{"lan": "cmn", "lan_doc": "中文"}], ["zh"])[0]["lan"] == "cmn"
 
 
 def test_linked_page_and_language_filter():
@@ -139,6 +140,9 @@ def test_extract_writes_selected_language():
             return [{"lan": "ai-zh", "lan_doc": "中文",
                      "subtitle_url": "https://example.com/subtitle"}]
 
+        def invalidate_subtitle_cache(self, bvid, aid, cid):
+            pass
+
         def fetch_subtitle(self, url, bvid):
             return BODY
 
@@ -154,6 +158,82 @@ def test_extract_writes_selected_language():
         srt = next(Path(f) for f in result["files"] if f.endswith(".srt"))
         assert srt.read_bytes().startswith(b"\xef\xbb\xbf")
         assert "你好" in srt.read_text(encoding="utf-8-sig")
+
+
+def test_extract_reports_empty_body_separately():
+    import tempfile
+
+    class Client:
+        def resolve(self, url):
+            return url
+
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "pages": [
+                        {"page": 1, "cid": 101, "part": "正片"}]}
+
+        def get_subtitle_list(self, bvid, aid, cid, on_log=None, force_refresh=False):
+            return [{"lan": "ai-zh", "lan_doc": "中文",
+                     "subtitle_url": "https://example.com/subtitle"}]
+
+        def invalidate_subtitle_cache(self, bvid, aid, cid):
+            pass
+
+        def fetch_subtitle(self, url, bvid):
+            return []
+
+        def polite_sleep(self):
+            pass
+
+    with tempfile.TemporaryDirectory() as temp:
+        result = extract_one(Client(),
+            "https://www.bilibili.com/video/BV11gYd6UEPv/",
+            ["txt"], "all", ["zh"], Path(temp), lambda msg: None)
+        assert result["status"] == "no_subtitle"
+        assert result["no_subtitle_pages"] == []
+        assert result["empty_body_pages"] == [1]
+        assert "正文接口" in result["message"]
+
+
+def test_extract_refreshes_tracks_after_empty_body():
+    import tempfile
+
+    class Client:
+        def __init__(self):
+            self.refreshed = False
+            self.fetches = []
+
+        def resolve(self, url):
+            return url
+
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "pages": [
+                        {"page": 1, "cid": 101, "part": "正片"}]}
+
+        def get_subtitle_list(self, bvid, aid, cid, on_log=None, force_refresh=False):
+            url = "https://example.com/new-subtitle" if self.refreshed else "https://example.com/expired-subtitle"
+            return [{"lan": "ai-zh", "lan_doc": "中文", "subtitle_url": url}]
+
+        def invalidate_subtitle_cache(self, bvid, aid, cid):
+            self.refreshed = True
+
+        def fetch_subtitle(self, url, bvid):
+            self.fetches.append(url)
+            return BODY if self.refreshed else []
+
+        def polite_sleep(self):
+            pass
+
+    with tempfile.TemporaryDirectory() as temp:
+        client = Client()
+        result = extract_one(client,
+            "https://www.bilibili.com/video/BV11gYd6UEPv/",
+            ["txt"], "all", ["zh"], Path(temp), lambda msg: None)
+        assert result["status"] == "ok"
+        assert len(result["files"]) == 1
+        assert client.fetches == ["https://example.com/expired-subtitle",
+                                  "https://example.com/new-subtitle"]
 
 
 def test_default_markdown_chinese():

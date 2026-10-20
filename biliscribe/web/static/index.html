@@ -453,7 +453,7 @@
       </div>
       <div class="info">
         <div class="it"><svg viewBox="0 0 24 24" fill="none" stroke="#23ADE5" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>使用提示</div>
-        <p>每行一个链接，支持 <b>b23.tv 短链</b>与 <b>?p= 分P</b>；仅能提取视频本身带有的 CC / AI 字幕，没有字幕的视频可用后续 ASR 转写兜底。</p>
+        <p>每行一个链接，支持 <b>b23.tv 短链</b>与 <b>?p= 分P</b>；仅提取视频本身带有的 CC / AI 字幕，不包含语音识别。</p>
       </div>
     </div>
 
@@ -755,7 +755,7 @@
       }
       if(r.status==='no_subtitle'){
         var ps = (r.no_subtitle_pages||[]).length ? '（分P：'+r.no_subtitle_pages.join(',')+'）' : '';
-        html += '<div class="sub-msg">未获取到所选语言的 CC / AI 字幕'+ps+'。可能是视频未提供该语言，也可能是接口暂时限流；可稍后重试。</div>';
+        html += '<div class="sub-msg">'+esc(r.message || ('未获取到所选语言的 CC / AI 字幕'+ps+'。可能是视频未提供该语言，也可能是接口暂时限流；可稍后重试。'))+'</div>';
       }
       if(r.status==='error'){
         html += '<div class="sub-msg err">失败原因：'+esc(r.message||'未知错误')+'</div>';

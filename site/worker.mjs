@@ -8,6 +8,12 @@ const MAX_PAGES = 8;
 const CONNECT_TIMEOUT_MS = 8000;
 const READ_TIMEOUT_MS = 12000;
 const TRANSIENT_RETRIES = 2;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 500;
+const CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const subtitleCache = new Map();
+let cacheBytes = 0;
+let biliRequestTail = Promise.resolve();
 
 function json(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -79,18 +85,27 @@ function cookieHeader(cookies) {
 async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
   let lastError;
   for (let attempt = 0; attempt <= TRANSIENT_RETRIES; attempt += 1) {
+    let release;
     try {
+      const turn = new Promise(resolve => { release = resolve; });
+      const previous = biliRequestTail;
+      biliRequestTail = previous.then(() => turn);
+      await previous;
+      await new Promise(resolve => setTimeout(resolve, 150));
       const response = await fetch(url, {
         headers: { 'user-agent': UA, 'accept': 'application/json, text/plain, */*',
           'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-          referer, ...(Object.keys(cookies).length ? { cookie: cookieHeader(cookies) } : {}) },
+          referer, ...options.headers,
+          ...(Object.keys(cookies).length ? { cookie: cookieHeader(cookies) } : {}) },
         redirect: options.redirect || 'follow',
         signal: AbortSignal.timeout(READ_TIMEOUT_MS),
       });
+      release();
       if (!response.ok && !(options.redirect === 'manual' && [301, 302, 303, 307, 308].includes(response.status)))
         throw new Error(`B站请求失败 (${response.status})`);
       return response;
     } catch (error) {
+      if (typeof release === 'function') release();
       lastError = error;
       if (attempt < TRANSIENT_RETRIES) await new Promise(resolve => setTimeout(resolve, 400 * (2 ** attempt)));
     }
@@ -189,19 +204,188 @@ function parsePages(spec, total, linkedPage) {
 }
 
 function resourceId(url) {
-  return String(url || '').split('/prod/').pop().split('?')[0];
+  const value = String(url || '');
+  try {
+    return new URL(normalizeSubtitleUrl(value)).pathname.split('/prod/').pop().split('?')[0];
+  } catch {
+    return value.split('/prod/').pop().split('?')[0];
+  }
+}
+
+const SUBTITLE_V2_KEYS = [
+  ['nP](wOFRvU.+<fjS{jn-!$D|Dz&",zT`', '=CFxYRn{.y|uVyO$uh&sikph?N.ilF/`bilibili'],
+  ['Bn"q~|albg@]Go~ACgyDvKnd+)_D}^&J?', "Cu~L!xs~f^&r@'vh=q]q{eeng*sEg^kp#Jbilibili"],
+];
+
+function normalizeSubtitleUrl(value) {
+  const raw = String(value || '').trim();
+  const absolute = new URL(raw.startsWith('//') ? `https:${raw}` : raw);
+  const host = absolute.hostname.toLowerCase();
+  if (absolute.protocol !== 'https:' || absolute.username || absolute.password ||
+      (absolute.port && absolute.port !== '443') ||
+      !(['bilibili.com', 'hdslb.com'].some(domain => host === domain || host.endsWith(`.${domain}`))))
+    throw new Error('字幕资源地址不受支持');
+  if (host === 'subtitle.bilibili.com') {
+    const cipher = decodeURIComponent(absolute.pathname.slice(1));
+    for (const [prefix, key] of SUBTITLE_V2_KEYS) {
+      let plain = '';
+      for (let i = 0; i < cipher.length; i++)
+        plain += String.fromCharCode(cipher.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+      if (plain.startsWith(prefix)) {
+        const path = plain.slice(prefix.length);
+        if (path.startsWith('/bfs/'))
+          return `https://aisubtitle.hdslb.com${path}${absolute.search}`;
+      }
+    }
+    throw new Error('字幕资源地址无法解码');
+  }
+  return absolute.href;
+}
+
+function readVarint(bytes, state) {
+  let value = 0n;
+  let shift = 0n;
+  while (state.offset < bytes.length) {
+    const byte = bytes[state.offset++];
+    value |= BigInt(byte & 0x7f) << shift;
+    if (!(byte & 0x80)) return value;
+    shift += 7n;
+    if (shift > 63n) throw new Error('字幕元数据 Protobuf varint 无效');
+  }
+  throw new Error('字幕元数据 Protobuf 被截断');
+}
+
+function protobufFields(bytes) {
+  const fields = [];
+  const state = { offset: 0 };
+  while (state.offset < bytes.length) {
+    const key = Number(readVarint(bytes, state));
+    const number = key >>> 3, wire = key & 7;
+    if (!number) throw new Error('字幕元数据 Protobuf 字段无效');
+    if (wire === 0) fields.push({ number, wire, value: readVarint(bytes, state) });
+    else if (wire === 1 || wire === 5) {
+      const size = wire === 1 ? 8 : 4;
+      const end = state.offset + size;
+      if (end > bytes.length) throw new Error('字幕元数据 Protobuf 被截断');
+      fields.push({ number, wire, value: bytes.slice(state.offset, end) });
+      state.offset = end;
+    } else if (wire === 2) {
+      const length = Number(readVarint(bytes, state));
+      const end = state.offset + length;
+      if (end > bytes.length) throw new Error('字幕元数据 Protobuf 被截断');
+      fields.push({ number, wire, value: bytes.slice(state.offset, end) });
+      state.offset = end;
+    } else throw new Error('字幕元数据 Protobuf wire type 不支持');
+  }
+  return fields;
+}
+
+function parseWebSubtitleResponse(bytes) {
+  const data = protobufFields(bytes).find(field => field.number === 1 && field.wire === 2)?.value;
+  if (!data) return [];
+  const decodeText = (fields, number) => {
+    const value = fields.find(field => field.number === number && field.wire === 2)?.value;
+    return value ? new TextDecoder('utf-8', { fatal: true }).decode(value) : null;
+  };
+  return protobufFields(data).filter(field => field.number === 3 && field.wire === 2)
+    .map(({ value }) => {
+      const fields = protobufFields(value);
+      const lan = decodeText(fields, 3), subtitle_url = decodeText(fields, 5);
+      if (!lan || !subtitle_url) return null;
+      const id = fields.find(field => field.number === 1 && field.wire === 0)?.value;
+      return { id: id === undefined ? null : id.toString(),
+        id_str: decodeText(fields, 2), lan, lan_doc: decodeText(fields, 4),
+        subtitle_url };
+    }).filter(Boolean);
+}
+
+function cacheRead(key) {
+  const item = subtitleCache.get(key);
+  if (!item || Date.now() - item.savedAt >= CACHE_TTL_MS) {
+    if (item) cacheBytes -= item.bytes;
+    subtitleCache.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function cacheWrite(key, value) {
+  const encoded = JSON.stringify(value);
+  const bytes = new TextEncoder().encode(encoded).byteLength;
+  if (bytes > CACHE_MAX_BYTES) return;
+  const previous = subtitleCache.get(key);
+  if (previous) cacheBytes -= previous.bytes;
+  while (subtitleCache.size >= CACHE_MAX_ENTRIES || cacheBytes + bytes > CACHE_MAX_BYTES) {
+    const oldest = subtitleCache.keys().next().value;
+    if (oldest === undefined) break;
+    cacheBytes -= subtitleCache.get(oldest).bytes;
+    subtitleCache.delete(oldest);
+  }
+  subtitleCache.set(key, { savedAt: Date.now(), value, bytes });
+  cacheBytes += bytes;
+}
+
+function cacheDelete(key) {
+  const previous = subtitleCache.get(key);
+  if (!previous) return;
+  cacheBytes -= previous.bytes;
+  subtitleCache.delete(key);
+}
+
+function uniqueTracks(tracks) {
+  const seen = new Set();
+  return tracks.filter(track => {
+    const key = resourceId(track.subtitle_url) || `${track.lan || ''}:${track.lan_doc || ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function languageMatches(value, wanted) {
+  const canonical = value => ({ cmn: 'zh', 'zh-cn': 'zh', 'zh-hans': 'zh',
+    'zh-hant': 'zh' }[value] || value);
+  const lan = String(value || '').trim().toLowerCase().replaceAll('_', '-');
+  return wanted.some(lang => {
+    const item = canonical(String(lang || '').trim().toLowerCase().replaceAll('_', '-'));
+    return canonical(lan) === item || lan.split('-').some(part => canonical(part) === item);
+  });
 }
 
 function belongs(track, aid, cid) {
   const id = resourceId(track.subtitle_url);
   if (!id) return false;
   const prefix = `${aid}${cid}`;
+  const lan = String(track.lan || '').toLowerCase();
+  if (/(^|[-_])zh([-_]|$)/.test(lan)) return id.startsWith(prefix);
   const head = id.slice(0, prefix.length);
   return !/^\d+$/.test(head) || head === prefix;
 }
 
 async function subtitleTracks(bvid, aid, cid, cookies) {
   const referer = `https://www.bilibili.com/video/${bvid}`;
+  const cacheKey = `tracks:${bvid}:${aid}:${cid}`;
+  const cached = cacheRead(cacheKey);
+  if (cached && cached.every(track => belongs(track, aid, cid))) return cached;
+  let modernWasEmpty = false;
+  try {
+    const response = await biliGet('https://api.bilibili.com/x/v2/subtitle/web/view?' +
+      new URLSearchParams({ oid: String(cid), pid: String(aid),
+        context_ext: '{"video_type":1}', type: '1', cur_production_type: '0',
+        playlist_switch: '0', arc_video_language: 'cmn', preferred_language: 'ai-zh',
+        web_location: '1315873' }),
+    cookies, `https://www.bilibili.com/video/${bvid}`,
+    { headers: { accept: 'application/octet-stream' } });
+    const modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer()));
+    modernWasEmpty = modern.length === 0;
+    const owned = uniqueTracks(modern.filter(track => track.lan && belongs(track, aid, cid)));
+    if (owned.length) {
+      cacheWrite(cacheKey, owned);
+      return owned;
+    }
+  } catch {
+    // Fall back to the JSON endpoint for older player responses.
+  }
   let sawForeign = false;
   for (const delay of [0, 2000, 5000]) {
     if (delay) await new Promise(resolve => setTimeout(resolve, delay));
@@ -209,12 +393,42 @@ async function subtitleTracks(bvid, aid, cid, cookies) {
       cookies, referer);
     const tracks = data.subtitle?.subtitles || [];
     if (!tracks.length) continue;
-    const good = tracks.filter(track => belongs(track, aid, cid));
-    sawForeign ||= good.length !== tracks.length;
-    if (good.length && good.length === tracks.length) return good;
+    const owned = tracks.filter(track => belongs(track, aid, cid));
+    const good = uniqueTracks(owned);
+    sawForeign ||= owned.length !== tracks.length;
+    if (owned.length && owned.length === tracks.length) {
+      cacheWrite(cacheKey, good);
+      return good;
+    }
+  }
+  if (sawForeign) {
+    try {
+      const response = await biliGet('https://api.bilibili.com/x/v2/subtitle/web/view?' +
+        new URLSearchParams({ oid: String(cid), pid: String(aid),
+          context_ext: '{"video_type":1}', type: '1', cur_production_type: '0',
+          playlist_switch: '0', arc_video_language: 'cmn', preferred_language: 'ai-zh',
+          web_location: '1315873' }),
+      cookies, referer, { headers: { accept: 'application/octet-stream' } });
+      const modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer()));
+      const recovered = uniqueTracks(modern.filter(track => track.lan && belongs(track, aid, cid)));
+      if (recovered.length) {
+        cacheWrite(cacheKey, recovered);
+        return recovered;
+      }
+    } catch {
+      // Keep the explicit foreign-track error when the modern endpoint cannot recover.
+    }
+  }
+  if (sawForeign && modernWasEmpty) {
+    throw new Error('未找到属于当前视频的可用字幕轨; 旧接口返回的字幕属于其他视频, 请确认播放器确实显示 CC/AI 字幕后再重试');
   }
   if (sawForeign) throw new Error('字幕接口多次返回其他视频的字幕轨，请稍后重试');
   return [];
+}
+
+async function refreshSubtitleTracks(bvid, aid, cid, cookies) {
+  cacheDelete(`tracks:${bvid}:${aid}:${cid}`);
+  return subtitleTracks(bvid, aid, cid, cookies);
 }
 
 async function primeSession(cookies, bvid) {
@@ -232,14 +446,16 @@ async function primeSession(cookies, bvid) {
 }
 
 async function subtitleBody(url, bvid, cookies) {
-  const absolute = new URL(url.startsWith('//') ? `https:${url}` : url);
-  if (absolute.protocol !== 'https:' ||
-      !(absolute.hostname.endsWith('.hdslb.com') || absolute.hostname.endsWith('.bilibili.com')))
-    throw new Error('字幕资源地址不受支持');
+  const absolute = new URL(normalizeSubtitleUrl(url));
+  const key = `body:${resourceId(absolute.href)}`;
+  const cached = cacheRead(key);
+  if (cached) return cached;
   const response = await biliGet(absolute.href, cookies,
     `https://www.bilibili.com/video/${bvid}`);
   const data = await response.json();
-  return Array.isArray(data.body) ? data.body : [];
+  const body = Array.isArray(data.body) ? data.body : [];
+  if (body.length) cacheWrite(key, body);
+  return body;
 }
 
 function safeName(value, max = 60) {
@@ -290,16 +506,29 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
   if (pages.length > MAX_PAGES) throw new Error(`云端单次最多处理 ${MAX_PAGES} 个分 P，请缩小范围`);
   const result = { url: rawUrl, bvid: info.bvid, title: info.title, owner: info.owner?.name || '',
     pic: info.pic || '', duration: info.duration || 0, pages_total: info.pages.length,
-    pages_done: 0, tracks: 0, files: [], no_subtitle_pages: [], status: 'ok' };
+    pages_done: 0, tracks: 0, files: [], no_subtitle_pages: [], empty_body_pages: [], status: 'ok' };
   for (const pageNumber of pages) {
     const page = info.pages.find(item => item.page === pageNumber);
     let tracks = await subtitleTracks(info.bvid, info.aid, page.cid, cookies);
-    if (!langs.includes('all')) tracks = tracks.filter(track =>
-      langs.some(lang => String(track.lan || '').toLowerCase().split(/[-_]/).includes(lang)));
+    if (!langs.some(lang => String(lang).trim().toLowerCase() === 'all'))
+      tracks = tracks.filter(track => languageMatches(track.lan, langs));
     if (!tracks.length) result.no_subtitle_pages.push(pageNumber);
-    for (const track of tracks) {
-      const body = await subtitleBody(track.subtitle_url, info.bvid, cookies);
-      if (!body.length) continue;
+    let pageHadEmptyBody = false;
+    let refreshedTracks = null;
+    for (let track of tracks) {
+      let body = await subtitleBody(track.subtitle_url, info.bvid, cookies);
+      if (!body.length && refreshedTracks === null) {
+        const fresh = await refreshSubtitleTracks(info.bvid, info.aid, page.cid, cookies);
+        refreshedTracks = fresh.filter(candidate => candidate.lan === track.lan);
+        for (const candidate of refreshedTracks) {
+          body = await subtitleBody(candidate.subtitle_url, info.bvid, cookies);
+          if (body.length) {
+            track = candidate;
+            break;
+          }
+        }
+      }
+      if (!body.length) { pageHadEmptyBody = true; continue; }
       const lan = track.lan || 'unk';
       const meta = { title: info.title, owner: result.owner, bvid: info.bvid,
         lan_doc: track.lan_doc || lan, page: pageNumber, part: page.part };
@@ -310,9 +539,14 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
         content: render(format, body, meta), format });
       result.tracks++;
     }
+    if (tracks.length && pageHadEmptyBody) result.empty_body_pages.push(pageNumber);
     result.pages_done++;
   }
-  if (!result.files.length) result.status = 'no_subtitle';
+  if (!result.files.length) {
+    result.status = 'no_subtitle';
+    if (result.empty_body_pages.length && !result.no_subtitle_pages.length)
+      result.message = '已找到所选语言字幕轨, 但字幕正文接口暂时返回空内容; 请稍后重试。';
+  }
   return result;
 }
 

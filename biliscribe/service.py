@@ -33,18 +33,24 @@ def parse_pages_spec(spec: str, total: int) -> list[int]:
 
 
 def _lang_match(lan: str, wanted: set[str]) -> bool:
-    """语言族匹配: 'zh' 可命中 ai-zh / zh-CN / zh-Hans, 'en' 命中 ai-en / en-US。"""
-    lan = (lan or "").lower()
-    if lan in wanted:
+    """语言族匹配: 统一 B 站别名后匹配 ai-zh / zh-CN / cmn 等轨道。"""
+    def canonical(value: str) -> str:
+        value = value.strip().lower().replace("_", "-")
+        return {"cmn": "zh", "zh-cn": "zh", "zh-hans": "zh",
+                "zh-hant": "zh"}.get(value, value)
+
+    lan = (lan or "").lower().replace("_", "-")
+    if canonical(lan) in {canonical(item) for item in wanted}:
         return True
-    parts = re.split(r"[-_]", lan)
-    return any(p in wanted for p in parts)
+    parts = re.split(r"-", lan)
+    return any(canonical(part) in {canonical(item) for item in wanted} for part in parts)
 
 
 def _pick_tracks(tracks: list[dict], langs: list[str]) -> list[dict]:
-    if not langs or "all" in langs:
+    normalized = [str(lang).strip().lower() for lang in langs if str(lang).strip()]
+    if not normalized or "all" in normalized:
         return tracks
-    wanted = {l.strip().lower() for l in langs if l.strip()}
+    wanted = set(normalized)
     picked = [t for t in tracks if _lang_match(t.get("lan", ""), wanted)]
     return picked
 
@@ -71,7 +77,8 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
               "owner": info["owner"], "pic": info.get("pic", ""),
               "duration": info.get("duration", 0),
               "pages_total": total, "pages_done": 0, "tracks": 0,
-              "files": [], "no_subtitle_pages": [], "status": "ok"}
+              "files": [], "no_subtitle_pages": [], "empty_body_pages": [],
+              "status": "ok"}
     multi = total > 1
     # 目录/文件名带 bvid, 避免同名视频互相覆盖
     title_part = subs_mod.safe_filename(info["title"], 60)
@@ -91,9 +98,30 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
         if not tracks:
             log(f"  {label}: 无所选语言的 CC/AI 字幕")
             result["no_subtitle_pages"].append(pno)
+        page_had_empty_body = False
+        refreshed_tracks = None
         for t in tracks:
             body = client.fetch_subtitle(t["subtitle_url"], bvid)
+            if not body and refreshed_tracks is None:
+                invalidate = getattr(client, "invalidate_subtitle_cache", None)
+                if not callable(invalidate):
+                    refreshed_tracks = []
+                    fresh = []
+                else:
+                    invalidate(bvid, info["aid"], page["cid"])
+                    fresh = client.get_subtitle_list(
+                        bvid, info["aid"], page["cid"], on_log=log,
+                        force_refresh=True)
+                refreshed_tracks = [candidate for candidate in
+                                    _pick_tracks(fresh, langs)
+                                    if candidate.get("lan") == t.get("lan")]
+                for candidate in refreshed_tracks:
+                    body = client.fetch_subtitle(candidate["subtitle_url"], bvid)
+                    if body:
+                        t = candidate
+                        break
             if not body:
+                page_had_empty_body = True
                 continue
             lan = t.get("lan", "unk")
             meta = {"title": info["title"], "owner": info["owner"], "bvid": bvid,
@@ -112,12 +140,16 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
             result["tracks"] += 1
             log(f"  {label} [{t.get('lan_doc', lan)}] {len(body)} 条 -> {', '.join(valid_fmts)}")
             client.polite_sleep()
+        if tracks and page_had_empty_body and pno not in result["empty_body_pages"]:
+            result["empty_body_pages"].append(pno)
         result["pages_done"] += 1
         if idx < len(page_nos) - 1:
             client.polite_sleep()
 
     if not result["files"]:
         result["status"] = "no_subtitle"
+        if result["empty_body_pages"] and not result["no_subtitle_pages"]:
+            result["message"] = "已找到所选语言字幕轨, 但字幕正文接口暂时返回空内容; 请稍后重试。"
     return result
 
 
