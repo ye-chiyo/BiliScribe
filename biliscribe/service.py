@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import os
 import re
 import threading
 import time
@@ -11,8 +12,23 @@ import uuid
 from pathlib import Path
 
 from . import subtitles as subs_mod
-from .api import BiliClient, BiliError, extract_urls, parse_video_url
+from .asr import AsrEngine, AudioSource, ParaformerEngine, segments_to_body
+from .api import (BiliClient, BiliError, ForeignSubtitleError, extract_urls,
+                  parse_video_url)
 from .auth import OUTPUT_DIR, get_client
+
+
+def _write_asr_export(path: Path, content: str, encoding: str) -> Path:
+    index = 1
+    while True:
+        target = path if index == 1 else path.with_name(
+            f"{path.stem} ({index}){path.suffix}")
+        try:
+            with target.open("x", encoding=encoding, newline="") as stream:
+                stream.write(content)
+            return target
+        except FileExistsError:
+            index += 1
 
 
 def parse_pages_spec(spec: str, total: int) -> list[int]:
@@ -51,7 +67,9 @@ def _pick_tracks(tracks: list[dict], langs: list[str]) -> list[dict]:
 
 def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
                 pages_spec: str, langs: list[str], out_dir: Path,
-                log) -> dict:
+                log, *, asr_engine: AsrEngine | None = None,
+                audio_source: AudioSource | None = None,
+                force_asr: bool = False) -> dict:
     url = client.resolve(raw_url.strip())
     bvid, aid, linked_page = parse_video_url(url)
     if not bvid and not aid:
@@ -71,7 +89,9 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
               "owner": info["owner"], "pic": info.get("pic", ""),
               "duration": info.get("duration", 0),
               "pages_total": total, "pages_done": 0, "tracks": 0,
-              "files": [], "no_subtitle_pages": [], "status": "ok"}
+              "files": [], "no_subtitle_pages": [], "subtitle_absent_pages": [],
+              "subtitle_mismatch_pages": [],
+              "asr_errors": [], "sources": [], "status": "ok"}
     multi = total > 1
     # 目录/文件名带 bvid, 避免同名视频互相覆盖
     title_part = subs_mod.safe_filename(info["title"], 60)
@@ -85,11 +105,63 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
     for idx, pno in enumerate(page_nos):
         page = next(p for p in info["pages"] if p["page"] == pno)
         label = f"P{pno}" + (f"《{page['part']}》" if multi else "")
-        tracks = client.get_subtitle_list(bvid, info["aid"], page["cid"],
-                                          on_log=log)
-        tracks = _pick_tracks(tracks, langs)
-        if not tracks:
-            log(f"  {label}: 无所选语言的 CC/AI 字幕")
+        if force_asr:
+            all_tracks = []
+        else:
+            try:
+                subtitle_kwargs = {"on_log": log}
+                # 保持兼容旧版客户端/mock，同时生产路径带 UP 主归属校验。
+                if info.get("owner_mid") is not None:
+                    subtitle_kwargs["owner_mid"] = info["owner_mid"]
+                all_tracks = client.get_subtitle_list(
+                    bvid, info["aid"], page["cid"], **subtitle_kwargs)
+            except ForeignSubtitleError:
+                all_tracks = []
+                result["subtitle_mismatch_pages"].append(pno)
+                log(f"  {label}: 字幕归属不匹配, 立即使用本地 ASR")
+        tracks = _pick_tracks(all_tracks, langs)
+        if force_asr or not all_tracks:
+            result["subtitle_absent_pages"].append(pno)
+            page_written = False
+            if asr_engine is not None and audio_source is not None:
+                try:
+                    with audio_source.open_audio(
+                            bvid=bvid, aid=info["aid"], page=page) as audio_path:
+                        segments = asr_engine.transcribe(audio_path, language="zh")
+                    body = segments_to_body(segments)
+                    if body:
+                        meta = {"title": info["title"], "owner": info["owner"],
+                                "bvid": bvid, "lan_doc": "机器转写（普通话）",
+                                "page": pno, "part": page["part"],
+                                "subtitle_source": "asr",
+                                "asr_model": getattr(asr_engine, "model_id", "unknown"),
+                                "asr_device": getattr(asr_engine, "device", None) or
+                                              getattr(asr_engine, "requested_device", "unknown"),
+                                "asr_timestamp_source": segments[0].timestamp_source}
+                        for fmt in valid_fmts:
+                            stem = (f"P{pno:02d}-{subs_mod.safe_filename(page['part'], 40)}.asr"
+                                    if multi else f"{title_part}_{bvid}.asr")
+                            fpath = video_dir / f"{stem}.{fmt}"
+                            enc = "utf-8-sig" if fmt == "srt" else "utf-8"
+                            fpath = _write_asr_export(
+                                fpath, subs_mod.render(fmt, body, meta), enc)
+                            result["files"].append(str(fpath))
+                        result["tracks"] += 1
+                        result["sources"].append("asr")
+                        page_written = True
+                        log(f"  {label} [机器转写] {len(body)} 条 -> {', '.join(valid_fmts)}")
+                    else:
+                        log(f"  {label}: ASR 未检测到语音")
+                except Exception as exc:
+                    message = f"P{pno}: {exc}"
+                    result["asr_errors"].append(message)
+                    log(f"  {label}: 本地 ASR 失败: {exc}")
+            else:
+                log(f"  {label}: 没有字幕轨道")
+            if not page_written:
+                result["no_subtitle_pages"].append(pno)
+        elif not tracks:
+            log(f"  {label}: 有字幕轨道，但没有所选语言")
             result["no_subtitle_pages"].append(pno)
         for t in tracks:
             body = client.fetch_subtitle(t["subtitle_url"], bvid)
@@ -110,13 +182,18 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
                 fpath.write_text(subs_mod.render(fmt, body, meta), encoding=enc)
                 result["files"].append(str(fpath))
             result["tracks"] += 1
+            source = "ai_subtitle" if str(lan).lower().startswith("ai-") else "cc"
+            if source not in result["sources"]:
+                result["sources"].append(source)
             log(f"  {label} [{t.get('lan_doc', lan)}] {len(body)} 条 -> {', '.join(valid_fmts)}")
             client.polite_sleep()
         result["pages_done"] += 1
         if idx < len(page_nos) - 1:
             client.polite_sleep()
 
-    if not result["files"]:
+    if result["asr_errors"]:
+        result["status"] = "partial" if result["files"] else "asr_error"
+    elif not result["files"]:
         result["status"] = "no_subtitle"
     return result
 
@@ -134,10 +211,16 @@ class JobManager:
         self._worker_started = False
 
     def create(self, urls_text: str, fmts=None, pages_spec: str = "all",
-               langs=None, out_dir: str | None = None) -> str:
+               langs=None, out_dir: str | None = None, *,
+               asr_enabled: bool = False, asr_engine: AsrEngine | None = None,
+               audio_source: AudioSource | None = None,
+               force_asr: bool = False) -> str:
         urls = extract_urls(urls_text)
         if not urls:
             raise ValueError("未识别到有效的 B 站视频链接")
+        if (asr_enabled or force_asr) and os.environ.get("BILISCRIBE_ASR_ENABLED", "false").lower() not in {
+                "1", "true", "yes", "on"}:
+            raise ValueError("本地 ASR 未启用；设置 BILISCRIBE_ASR_ENABLED=true")
         job_id = uuid.uuid4().hex[:12]
         out = Path(out_dir) if out_dir else OUTPUT_DIR
         out.mkdir(parents=True, exist_ok=True)
@@ -147,8 +230,11 @@ class JobManager:
         with self.lock:
             self.jobs[job_id] = job
             self._prune_locked()
+        if (asr_enabled or force_asr) and asr_engine is None:
+            asr_engine = ParaformerEngine()
         self._q.put((job, urls, fmts or ["md"], pages_spec,
-                     langs or ["zh"], out))
+                     langs or ["zh"], out, asr_enabled or force_asr,
+                     asr_engine, audio_source, force_asr))
         self._ensure_worker()
         return job_id
 
@@ -183,7 +269,9 @@ class JobManager:
         with self.lock:
             job["logs"].append(line)
 
-    def _run(self, job, urls, fmts, pages_spec, langs, out):
+    def _run(self, job, urls, fmts, pages_spec, langs, out,
+             asr_enabled=False, asr_engine=None, audio_source=None,
+             force_asr=False):
         job["status"] = "running"
         try:
             with get_client() as client:
@@ -199,11 +287,24 @@ class JobManager:
                               "仍尝试提取, 若失败请检查网络后重试")
                 else:
                     self._log(job, f"登录账号: {nav['uname']} | 共 {len(urls)} 个链接")
+                if asr_enabled and audio_source is None:
+                    from .audio import BilibiliAudioSource
+                    audio_source = BilibiliAudioSource(
+                        cookies=client.cookies_dict(),
+                        max_audio_mb=float(os.environ.get("BILISCRIBE_ASR_MAX_AUDIO_MB", "512")),
+                        max_duration_seconds=int(os.environ.get(
+                            "BILISCRIBE_ASR_MAX_DURATION_SECONDS", "7200")),
+                    )
+                if asr_enabled:
+                    self._log(job, "本地 ASR 已启用；若需转写，首次模型加载或下载期间进度可能暂不变化")
                 for i, u in enumerate(urls):
                     self._log(job, f"({i + 1}/{len(urls)}) 处理: {u}")
                     try:
                         r = extract_one(client, u, fmts, pages_spec, langs, out,
-                                        lambda m: self._log(job, m))
+                                        lambda m: self._log(job, m),
+                                        asr_engine=asr_engine if asr_enabled else None,
+                                        audio_source=audio_source if asr_enabled else None,
+                                        force_asr=force_asr)
                         job["results"].append(r)
                         if r["status"] == "no_subtitle":
                             self._log(job, "  -> 该视频没有可用字幕")

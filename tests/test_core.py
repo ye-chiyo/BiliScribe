@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from biliscribe.api import extract_urls, parse_video_url
+from biliscribe.api import BiliError, extract_urls, parse_video_url
 from biliscribe.cli import build_parser
 from biliscribe.service import _pick_tracks, extract_one, parse_pages_spec
 from biliscribe.service import JobManager
+from biliscribe.asr import LocalAudioSource, Segment, segments_to_body
 from biliscribe.web.server import ExtractReq
 from biliscribe.subtitles import (_hms, safe_filename, to_md, to_srt, to_txt,
                                   to_vtt)
@@ -156,13 +160,184 @@ def test_extract_writes_selected_language():
         assert "你好" in srt.read_text(encoding="utf-8-sig")
 
 
+def test_asr_segments_to_body_filters_invalid_segments():
+    segments = [
+        Segment(2, 3, "保留"),
+        Segment(-1, 1, "负数跳过"),
+        Segment(4, 4, "零长度跳过"),
+        Segment(5, 6, "  "),
+    ]
+    assert segments_to_body(segments) == [
+        {"from": 2, "to": 3, "content": "保留"}
+    ]
+
+
+def test_local_audio_source_supports_page_mapping(tmp_path):
+    p1 = tmp_path / "p1.wav"
+    p1.write_bytes(b"wav")
+    source = LocalAudioSource({1: p1})
+    with source.open_audio(bvid="BV1", aid=1, page={"page": 1}) as audio:
+        assert audio == p1
+
+
+def test_extract_uses_asr_only_when_no_tracks(tmp_path):
+    class Engine:
+        model_id = "mock-paraformer"
+        device = "cpu"
+
+        def __init__(self):
+            self.calls = []
+
+        def transcribe(self, audio_path, *, language="zh", offset_seconds=0):
+            self.calls.append((audio_path, language, offset_seconds))
+            return [Segment(1, 2, "机器转写")]
+
+    class Source:
+        @contextmanager
+        def open_audio(self, **kwargs):
+            yield tmp_path / "mock.wav"
+
+    class Client:
+        def resolve(self, url): return url
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "pages": [
+                        {"page": 1, "cid": 101, "part": "正片"},
+                        {"page": 2, "cid": 102, "part": "片尾"}]}
+        def get_subtitle_list(self, bvid, aid, cid, on_log=None):
+            return [] if cid == 101 else [{"lan": "ai-zh", "lan_doc": "中文",
+                                           "subtitle_url": "https://example.com/sub"}]
+        def fetch_subtitle(self, url, bvid): return BODY
+        def polite_sleep(self): pass
+
+    engine = Engine()
+    result = extract_one(Client(),
+        "https://www.bilibili.com/video/BV11gYd6UEPv/", ["txt"],
+        "all", ["zh"], tmp_path, lambda msg: None,
+        asr_engine=engine, audio_source=Source())
+    assert engine.calls and result["sources"] == ["asr", "ai_subtitle"]
+    assert result["subtitle_absent_pages"] == [1]
+    assert result["status"] == "ok"
+
+
+def test_extract_uses_asr_immediately_on_foreign_tracks(tmp_path):
+    from biliscribe.api import ForeignSubtitleError
+
+    class Engine:
+        model_id = "mock-paraformer"
+        device = "cpu"
+        def transcribe(self, *args, **kwargs):
+            return [Segment(1, 2, "串轨后转写")]
+
+    class Source:
+        @contextmanager
+        def open_audio(self, **kwargs):
+            yield tmp_path / "mock.wav"
+
+    class Client:
+        def resolve(self, url): return url
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "owner_mid": 456,
+                    "pages": [{"page": 1, "cid": 101, "part": "正片"}]}
+        def get_subtitle_list(self, *args, **kwargs):
+            raise ForeignSubtitleError()
+
+    result = extract_one(Client(),
+        "https://www.bilibili.com/video/BV11gYd6UEPv/", ["txt"],
+        "all", ["zh"], tmp_path, lambda msg: None,
+        asr_engine=Engine(), audio_source=Source())
+    assert result["status"] == "ok"
+    assert result["subtitle_mismatch_pages"] == [1]
+    assert result["sources"] == ["asr"]
+
+
+def test_extract_asr_failure_is_recorded_per_page(tmp_path):
+    class Engine:
+        model_id = "mock"
+        def transcribe(self, *args, **kwargs): raise RuntimeError("mock failure")
+    class Source:
+        @contextmanager
+        def open_audio(self, **kwargs): yield tmp_path / "mock.wav"
+    class Client:
+        def resolve(self, url): return url
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "pages": [{"page": 1, "cid": 101, "part": "正片"}]}
+        def get_subtitle_list(self, *args, **kwargs): return []
+    result = extract_one(Client(),
+        "https://www.bilibili.com/video/BV11gYd6UEPv/", ["txt"],
+        "all", ["zh"], tmp_path, lambda msg: None,
+        asr_engine=Engine(), audio_source=Source())
+    assert result["status"] == "asr_error"
+    assert "P1: mock failure" in result["asr_errors"]
+
+
+def test_language_filter_does_not_trigger_asr_when_other_track_exists(tmp_path):
+    class Source:
+        @contextmanager
+        def open_audio(self, **kwargs):
+            raise AssertionError("已有字幕轨时不应下载音频")
+            yield  # pragma: no cover
+
+    class Engine:
+        model_id = "mock"
+        def transcribe(self, *args, **kwargs):
+            raise AssertionError("已有字幕轨时不应加载 ASR")
+
+    class Client:
+        def resolve(self, url): return url
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "pages": [{"page": 1, "cid": 101, "part": "正片"}]}
+        def get_subtitle_list(self, *args, **kwargs):
+            return [{"lan": "ai-en", "lan_doc": "English",
+                     "subtitle_url": "https://example.com/sub"}]
+        def fetch_subtitle(self, url, bvid):
+            return BODY
+        def polite_sleep(self): pass
+
+    result = extract_one(Client(),
+        "https://www.bilibili.com/video/BV11gYd6UEPv/", ["txt"],
+        "all", ["zh"], tmp_path, lambda msg: None,
+        asr_engine=Engine(), audio_source=Source())
+    assert result["status"] == "no_subtitle"
+    assert result["subtitle_absent_pages"] == []
+    assert result["no_subtitle_pages"] == [1]
+
+
+def test_subtitle_api_error_does_not_trigger_asr(tmp_path):
+    class Source:
+        @contextmanager
+        def open_audio(self, **kwargs):
+            raise AssertionError("字幕接口异常时不应下载音频")
+            yield  # pragma: no cover
+
+    class Client:
+        def resolve(self, url): return url
+        def get_video_info(self, **kwargs):
+            return {"bvid": "BV11gYd6UEPv", "aid": 123, "title": "测试",
+                    "owner": "UP", "pages": [{"page": 1, "cid": 101, "part": "正片"}]}
+        def get_subtitle_list(self, *args, **kwargs):
+            from biliscribe.api import BiliError
+            raise BiliError(-412, "限流")
+
+    with pytest.raises(BiliError, match="限流"):
+        extract_one(Client(),
+            "https://www.bilibili.com/video/BV11gYd6UEPv/", ["txt"],
+            "all", ["zh"], tmp_path, lambda msg: None,
+            asr_engine=object(), audio_source=Source())
+
+
 def test_default_markdown_chinese():
     import tempfile
 
     args = build_parser().parse_args(["extract", "https://www.bilibili.com/video/BV11gYd6UEPv/"])
     assert args.fmts == "md" and args.langs == "zh"
+    assert args.asr == "off"
     req = ExtractReq(urls="https://www.bilibili.com/video/BV11gYd6UEPv/")
     assert req.fmts == ["md"] and req.langs == ["zh"]
+    assert req.asr_local is False
 
     with tempfile.TemporaryDirectory() as temp:
         mgr = JobManager()

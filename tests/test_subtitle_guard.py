@@ -10,7 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import biliscribe.api as api
-from biliscribe.api import BiliClient, BiliError, track_belongs_to_video
+from biliscribe.api import (BiliClient, BiliError, ForeignSubtitleError,
+                            track_belongs_to_video)
 
 AID = 117237407029445
 CID = 41706587832
@@ -35,6 +36,11 @@ def test_track_owner_check():
     assert track_belongs_to_video(t(""), AID, CID) is False
     # 无 aid 无法校验, 放行(不应误杀)
     assert track_belongs_to_video(t(ZH_BAD), None, CID) is True
+    assert track_belongs_to_video(
+        {**t(EN_GOOD), "author_mid": 999}, AID, CID, owner_mid=123) is False
+    assert track_belongs_to_video(
+        {**t(EN_GOOD), "author_mid": 123}, AID, CID, owner_mid=123) is True
+    assert track_belongs_to_video(t(EN_GOOD), AID, CID, owner_mid=123) is False
 
 
 # ---------- get_subtitle_list 重试/缓存 ----------
@@ -71,32 +77,33 @@ def v2_data(*tracks):
     return {"subtitle": {"subtitles": list(tracks)}}
 
 
-def test_retry_until_owned():
+def test_foreign_track_is_reported_immediately():
     h = _Harness([
-        v2_data(t(ZH_BAD)),                                   # 第 1 轮: 串到其他视频
-        v2_data(t(ZH_GOOD), t(EN_GOOD, "ai-en", "English")),  # 第 2 轮: 正确
+        v2_data(t(ZH_BAD)),
     ])
     try:
         logs = []
-        tracks = h.client.get_subtitle_list(BVID, AID, CID, on_log=logs.append)
-        assert {x["subtitle_url"] for x in tracks} == {ZH_GOOD, EN_GOOD}
-        assert len(h.calls) == 2
+        try:
+            h.client.get_subtitle_list(BVID, AID, CID, on_log=logs.append)
+        except ForeignSubtitleError:
+            pass
+        else:
+            raise AssertionError("串轨字幕必须触发专用异常")
+        assert len(h.calls) == 1
         # 只允许 bvid 形式, 不得回退 aid 形式
         assert all("aid=" not in u for u in h.calls), h.calls
         assert all("_ts=" in u for u in h.calls), h.calls
         assert any("其他视频" in m for m in logs)
-        # 缓存落盘且为校验通过的结果
+        # 串轨数据不得落盘
         cf = Path(h.tmp.name) / f"{CID}_list.json"
-        assert cf.exists()
-        cached = json.loads(cf.read_text(encoding="utf-8"))
-        assert all(track_belongs_to_video(x, AID, CID) for x in cached)
+        assert not cf.exists()
     finally:
         h.close()
-    print("[PASS] 串轨后自动重试, 拿到正确字幕且只缓存正确结果")
+    print("[PASS] 串轨数据被拒绝且不写入缓存")
 
 
 def test_all_rounds_bad_raises():
-    h = _Harness([v2_data(t(ZH_BAD))] * 3)
+    h = _Harness([v2_data(t(ZH_BAD))])
     try:
         raised = False
         try:
@@ -105,7 +112,7 @@ def test_all_rounds_bad_raises():
             raised = True
             assert "其他视频" in e.message
         assert raised
-        assert len(h.calls) == 3
+        assert len(h.calls) == 1
         # 全部失败时不得写缓存
         assert not (Path(h.tmp.name) / f"{CID}_list.json").exists()
     finally:
@@ -138,6 +145,22 @@ def test_empty_then_success():
     finally:
         h.close()
     print("[PASS] 空列表退避重试行为保持正常")
+
+
+def test_retry_query_cache_buster_changes_each_round():
+    """确认串轨后立即转 ASR，不等待空字幕或继续导出。"""
+    h = _Harness([v2_data(t(ZH_BAD))])
+    try:
+        try:
+            h.client.get_subtitle_list(BVID, AID, CID)
+        except ForeignSubtitleError:
+            pass
+        else:
+            raise AssertionError("串轨字幕必须触发本地 ASR 路由")
+        assert len(h.calls) == 1
+    finally:
+        h.close()
+    print("[PASS] 确认串轨后立即转入本地 ASR")
 
 
 def test_all_rounds_empty_is_no_subtitle():
@@ -196,10 +219,11 @@ def test_body_cache_key_is_stable_rid():
 
 if __name__ == "__main__":
     test_track_owner_check()
-    test_retry_until_owned()
+    test_foreign_track_is_reported_immediately()
     test_all_rounds_bad_raises()
     test_dirty_cache_discarded()
     test_empty_then_success()
+    test_retry_query_cache_buster_changes_each_round()
     test_all_rounds_empty_is_no_subtitle()
     test_no_bvid_raises()
     test_body_cache_key_is_stable_rid()

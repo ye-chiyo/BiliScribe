@@ -48,5 +48,6 @@ echo 正在启动本地控制台，浏览器将自动打开 http://127.0.0.1:8765
 echo 若 8765 端口被占用，会自动更换端口，请注意本窗口中的实际地址。
 echo 关闭此黑窗口即停止服务。
 echo.
+set BILISCRIBE_ASR_ENABLED=true
 python -m biliscribe web
 pause

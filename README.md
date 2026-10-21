@@ -42,11 +42,24 @@ python -m biliscribe extract "视频链接"      # 默认导出 md（仅中文�
 python -m biliscribe extract "链接" --fmts srt,md --pages 1,3-5
 python -m biliscribe extract "链接" --langs zh      # 仅中文轨
 python -m biliscribe extract "链接" --langs en      # 仅英文轨
+python -m biliscribe extract "链接" --asr local    # 无字幕分P时启用本地 ASR
 python -m biliscribe extract "链接1" "链接2"
 echo "链接文本" | python -m biliscribe extract      # 支持管道输入
 python -m biliscribe web --port 8765       # 启动网页控制台
 python -m biliscribe logout                # 删除本地凭证
 ```
+
+## AI 客户端（MCP）
+
+可选安装 `requirements-mcp.txt` 后，通过 stdio MCP 提供现有字幕提取、能力查询和本地音频转写工具。ASR 默认关闭；Windows 客户端配置示例与允许目录说明见 [`docs/mcp-local-ai.md`](docs/mcp-local-ai.md)。
+
+网页默认勾选“无字幕时使用本地 ASR”，Windows `启动.bat` 会为本地 Web 服务启用该能力；
+仅当接口确认无有效字幕轨（包括确认返回其他视频的字幕轨）时才会下载音频并转写；
+字幕接口网络、登录或限流错误仍按错误返回，不会误当成无字幕。首次配置需按本机硬件安装
+`requirements-asr.txt` 中的 FunASR/PyTorch（CUDA 版请先选择匹配的 PyTorch wheel）、
+安装 `requirements-audio.txt` 中的 yt-dlp，并确保 ffmpeg/ffprobe 在 PATH 中。
+CLI 仍需显式传入 `--asr local` 且设置 `BILISCRIBE_ASR_ENABLED=true`；MCP 的 ASR 开关
+也继续独立控制，默认关闭。未安装可选依赖时，取消网页勾选仍可正常提取 CC/AI 字幕。
 
 ## 输出文件与命名
 
@@ -66,6 +79,9 @@ BiliScribe/
 │  ├─ auth.py         # 登录凭证本地持久化（原子写入，防损坏）
 │  ├─ subtitles.py    # SRT/VTT/TXT/JSON/MD 转换（时间轴进位/缺字段容错）
 │  ├─ service.py      # 提取编排、语言筛选、串行作业队列、文件命名
+│  ├─ asr.py          # 可选 Paraformer 引擎与字幕片段接口
+│  ├─ audio.py        # 可选 B 站音频下载、ffmpeg 转码、临时文件清理
+│  ├─ mcp_server.py   # 可选 stdio MCP 服务
 │  ├─ cli.py          # 命令行入口
 │  └─ web/            # 本地网页控制台（FastAPI + 原生 HTML/CSS/JS，零构建）
 ├─ data/              # 登录凭证与缓存（请勿外传、勿截图分享）
@@ -76,9 +92,29 @@ BiliScribe/
 └─ README.md
 ```
 
+## 测试
+
+在项目虚拟环境中运行离线单元测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+仓库根目录的 `pytest.ini` 将默认收集范围固定为 `tests/` 中的离线测试，
+避免扫描 `github-checkout/` 等嵌套仓库。Web 冒烟和真实 B 站提取测试需要
+先启动本地服务及其依赖，默认不由 pytest 收集；准备好环境后可显式运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m biliscribe web --port 8765
+# 在另一个终端中：
+.\.venv\Scripts\python.exe tests/test_web.py
+.\.venv\Scripts\python.exe tests/test_web_extras.py
+.\.venv\Scripts\python.exe tests/test_web_extract.py
+```
+
 ## v0.3.1 更新要点
 
-- **降低「提取到其他视频字幕」的风险**：当字幕资源 id 含有 aid+cid 归属段时，校验其是否属于当前视频；校验失败会退避重试。部分纯十六进制资源 id 不含可核验的归属段，当前只能放行，无法保证所有字幕轨都可验证归属。
+- **降低「提取到其他视频字幕」的风险**：当字幕资源 id 含有 aid+cid 归属段时，校验其是否属于当前视频；确认串轨时拒绝该响应，并在本地 ASR 已启用时立即回退。部分纯十六进制资源 id 不含可核验的归属段；生产请求会同时使用字幕作者归属信息进行校验。
 - 字幕列表查询统一走 bvid 形式（av 号链接经视频信息接口换算为 bvid），不再使用 aid 形式
 - 正文缓存键改为稳定的字幕资源 id（不再含时效签名 auth_key），同一字幕轨刷新签名后仍命中缓存，且缓存天然按视频隔离
 - 本地缓存的字幕列表同样经过归属校验，历史脏缓存会自动丢弃重拉
@@ -102,9 +138,9 @@ BiliScribe/
 - **提示未登录 / 字幕为空？** B 站字幕接口必须登录，游客拿不到字幕列表；请先扫码登录。
 - **顶栏显示「网络异常，登录态未校验」？** 断网时无法联网校验凭证，本地凭证仍在；网络恢复后刷新页面即可。
 - **二维码失效？** 二维码 180 秒有效，失效后点弹层中的「重新获取二维码」即可；重复点扫码会自动释放上一个二维码会话。
-- **视频提示「无所选语言的 CC/AI 字幕」？** 可能是视频没有该语言字幕，也可能是接口临时限流返回空列表；可稍后重试。后续版本计划加入本地语音转写（ASR）兜底。
+- **视频提示「无所选语言的 CC/AI 字幕」？** 视频可能没有所选语言的字幕；仅当确认没有任何有效字幕轨时，网页才会按设置回退到本地 ASR。字幕接口网络、登录或限流错误会保留为错误，不会启动 ASR。
 - **网页上明明有字幕，软件却偶尔提示无字幕？** 短时间高频请求会触发 B 站临时限流（字幕列表概率性返回空）。软件已内置设备指纹、视频页预热、退避重试与 24 小时本地缓存；遇到时等几分钟再试即可，成功提取过的视频再次导出走缓存、不再请求接口。
-- **提示「字幕接口多次返回其他视频的数据」？** B 站接口偶发把别的视频字幕轨返回给当前视频（v0.3.1 起会自动识别并重试）。若多次重试仍失败，等几分钟再提取即可；该提示意味着本次没有写入任何字幕文件，不会产生内容错误的文件。
+- **字幕接口返回其他视频的轨道？** 程序会拒绝串轨数据，并立即对该分 P 回退到本地 ASR；不会导出疑似其他视频的字幕。
 - **支持哪些字幕语言？** 视频提供几种语言就可导出几种（实测可同时拿到中、英、西、葡等 AI 翻译轨）；语言代码按词缀匹配，如 `zh` 同时命中 `ai-zh` 与 `zh-CN`。
 - **换电脑 / 重新安装？** 复制整个项目目录即可；`data/` 里是登录凭证，不要分享给他人。
 - **安全吗？** 程序只与 `bilibili.com` 通信，凭证保存在本地 `data/`（原子写入），日志不会打印 Cookie。
