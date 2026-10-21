@@ -24,6 +24,8 @@ class ExtractReq(BaseModel):
     pages: str = "all"
     langs: list[str] = ["zh"]
     out_dir: str | None = None
+    asr_local: bool = False
+    asr_force: bool = False
 
 
 def create_app() -> FastAPI:
@@ -85,7 +87,9 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": "not_logged_in"}, status_code=401)
         try:
             job_id = jobs.create(req.urls, fmts=req.fmts, pages_spec=req.pages,
-                                 langs=req.langs, out_dir=req.out_dir)
+                                 langs=req.langs, out_dir=req.out_dir,
+                                 asr_enabled=req.asr_local,
+                                 force_asr=req.asr_force)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         return {"job_id": job_id}

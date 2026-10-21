@@ -12,7 +12,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import biliscribe.api as api
-from biliscribe.api import (BiliClient, BiliError, parse_web_subtitle_response,
+from biliscribe.api import (BiliClient, BiliError, ForeignSubtitleError,
+                            parse_web_subtitle_response,
                             track_belongs_to_video)
 
 AID = 117237407029445
@@ -48,6 +49,14 @@ def test_track_owner_check():
     assert track_belongs_to_video(t(""), AID, CID) is False
     # 无 aid 无法校验, 放行(不应误杀)
     assert track_belongs_to_video(t(ZH_BAD), None, CID) is True
+    assert track_belongs_to_video(
+        {**t(EN_GOOD, "ai-en", "English"), "author_mid": 999},
+        AID, CID, owner_mid=123) is False
+    assert track_belongs_to_video(
+        {**t(EN_GOOD, "ai-en", "English"), "author_mid": 123},
+        AID, CID, owner_mid=123) is True
+    assert track_belongs_to_video(
+        t(EN_GOOD, "ai-en", "English"), AID, CID, owner_mid=123) is False
 
 
 def test_chinese_track_with_mismatched_numeric_prefix_is_rejected():
@@ -91,34 +100,35 @@ def v2_data(*tracks):
     return {"subtitle": {"subtitles": list(tracks)}}
 
 
-def test_retry_until_owned():
+def test_foreign_track_is_reported_immediately():
     h = _Harness([
-        v2_data(t(ZH_BAD)),                                   # 第 1 轮: 串到其他视频
-        v2_data(t(ZH_GOOD), t(EN_GOOD, "ai-en", "English")),  # 第 2 轮: 正确
+        v2_data(t(ZH_BAD)),
     ])
     try:
         logs = []
-        tracks = h.client.get_subtitle_list(BVID, AID, CID, on_log=logs.append)
-        assert {x["subtitle_url"] for x in tracks} == {ZH_GOOD, EN_GOOD}
-        assert len(h.calls) == 2
+        try:
+            h.client.get_subtitle_list(BVID, AID, CID, on_log=logs.append)
+        except ForeignSubtitleError:
+            pass
+        else:
+            raise AssertionError("串轨字幕必须触发专用异常")
+        assert len(h.calls) == 1
         # 只允许 bvid 形式, 不得回退 aid 形式
         assert all("aid=" not in u for u in h.calls), h.calls
         assert all("_ts=" in u for u in h.calls), h.calls
         assert len({u.split("_ts=", 1)[1] for u in h.calls}) == len(h.calls), h.calls
         assert any("其他视频" in m for m in logs)
-        # 缓存落盘且为校验通过的结果
+        # 串轨数据不得落盘
         cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
         cf = Path(h.tmp.name) / f"{cache_key}_list.json"
-        assert cf.exists()
-        cached = json.loads(cf.read_text(encoding="utf-8"))
-        assert all(track_belongs_to_video(x, AID, CID) for x in cached)
+        assert not cf.exists()
     finally:
         h.close()
-    print("[PASS] 串轨后自动重试, 拿到正确字幕且只缓存正确结果")
+    print("[PASS] 串轨数据被拒绝且不写入缓存")
 
 
 def test_all_rounds_bad_raises():
-    h = _Harness([v2_data(t(ZH_BAD))] * 3)
+    h = _Harness([v2_data(t(ZH_BAD))])
     try:
         raised = False
         try:
@@ -127,43 +137,13 @@ def test_all_rounds_bad_raises():
             raised = True
             assert "其他视频" in e.message
         assert raised
-        assert len(h.calls) == 3
+        assert len(h.calls) == 1
         # 全部失败时不得写缓存
         cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
         assert not (Path(h.tmp.name) / f"{cache_key}_list.json").exists()
     finally:
         h.close()
     print("[PASS] 连续串轨时明确报错, 绝不导出错误字幕")
-
-
-def test_empty_modern_metadata_explains_foreign_legacy_tracks():
-    h = _Harness([v2_data(t(ZH_BAD))] * 3)
-    try:
-        try:
-            h.client.get_subtitle_list(BVID, AID, CID)
-        except BiliError as exc:
-            assert "未找到属于当前视频" in exc.message
-            assert "播放器确实显示" in exc.message
-        else:
-            raise AssertionError("现代接口为空且旧接口串轨时应给出明确诊断")
-    finally:
-        h.close()
-    print("[PASS] 现代接口为空时明确区分无可用字幕与串轨")
-
-
-def test_foreign_legacy_tracks_recover_with_modern_refresh():
-    h = _Harness([v2_data(t(ZH_BAD))] * 3)
-    try:
-        modern = [[], [t(ZH_GOOD)]]
-        def modern_refresh(*args, **kwargs):
-            return modern.pop(0) if modern else []
-        h.client._get_modern_subtitle_list = modern_refresh
-        tracks = h.client.get_subtitle_list(BVID, AID, CID)
-        assert tracks[0]["subtitle_url"] == ZH_GOOD
-        assert len(h.calls) == 3
-    finally:
-        h.close()
-    print("[PASS] 旧接口持续串轨后, 现代接口刷新可恢复")
 
 
 def test_dirty_cache_discarded():
@@ -290,6 +270,20 @@ def test_unknown_encoded_subtitle_url_is_rejected():
     else:
         raise AssertionError("未知编码字幕地址不得直接请求")
     print("[PASS] 未知编码字幕地址被拒绝")
+def test_foreign_track_routes_to_asr_immediately():
+    """确认串轨后立即转 ASR，不等待空字幕或继续导出。"""
+    h = _Harness([v2_data(t(ZH_BAD))])
+    try:
+        try:
+            h.client.get_subtitle_list(BVID, AID, CID)
+        except ForeignSubtitleError:
+            pass
+        else:
+            raise AssertionError("串轨字幕必须触发本地 ASR 路由")
+        assert len(h.calls) == 1
+    finally:
+        h.close()
+    print("[PASS] 确认串轨后立即转入本地 ASR")
 
 
 def test_all_rounds_empty_is_no_subtitle():
@@ -409,15 +403,15 @@ def test_stale_empty_body_cache_is_discarded():
 
 if __name__ == "__main__":
     test_track_owner_check()
-    test_retry_until_owned()
+    test_foreign_track_is_reported_immediately()
     test_all_rounds_bad_raises()
-    test_foreign_legacy_tracks_recover_with_modern_refresh()
     test_dirty_cache_discarded()
     test_empty_then_success()
     test_modern_web_subtitle_protobuf_is_preferred()
     test_encoded_subtitle_url_is_decoded_before_download()
     test_second_rotating_subtitle_key_matches_player_sample()
     test_unknown_encoded_subtitle_url_is_rejected()
+    test_foreign_track_routes_to_asr_immediately()
     test_all_rounds_empty_is_no_subtitle()
     test_no_bvid_raises()
     test_body_cache_key_is_stable_rid()

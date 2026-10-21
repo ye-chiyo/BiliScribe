@@ -1,0 +1,2 @@
+# Optional Bilibili audio download adapter for P3 local ASR fallback.
+yt-dlp==2026.8.19

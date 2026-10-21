@@ -204,6 +204,13 @@ class BiliError(Exception):
         self.message = message
 
 
+class ForeignSubtitleError(BiliError):
+    """字幕接口返回了可确认属于其他视频的字幕轨。"""
+
+    def __init__(self, message: str = "字幕接口返回了其他视频的数据"):
+        super().__init__(-1001, message)
+
+
 def subtitle_resource_id(subtitle_url: str) -> str:
     """Return a stable resource id for legacy and encoded subtitle URLs."""
     raw = str(subtitle_url or "")
@@ -221,13 +228,20 @@ def _track_key(track: dict) -> str:
     return subtitle_resource_id(str(track.get("subtitle_url", "")))
 
 
-def track_belongs_to_video(track: dict, aid: int | None, cid: int) -> bool:
+def track_belongs_to_video(track: dict, aid: int | None, cid: int,
+                           owner_mid: int | None = None) -> bool:
     """校验一条字幕轨是否确实属于当前视频。
 
     B 站 player/v2 会概率性返回*其他视频*的字幕轨(2026-09 实测: bvid 形式
     约 1/6 概率, aid 形式几乎必现)。AI 中文字幕资源 id 形如 "{aid}{cid}{hex}",
     可据此校验归属; 英文轨多为 32 位纯 hex(无数字归属段), 无法校验时放行。
     """
+    if owner_mid is not None and track.get("author_mid") is not None:
+        try:
+            if int(track["author_mid"]) != int(owner_mid):
+                return False
+        except (TypeError, ValueError):
+            return False
     rid = subtitle_resource_id(track.get("subtitle_url", ""))
     if not rid:
         return False
@@ -243,9 +257,10 @@ def track_belongs_to_video(track: dict, aid: int | None, cid: int) -> bool:
         if head.isdigit():
             # 带数字归属段的资源 id: 必须严格等于本视频 aid+cid
             return head == prefix
-        # 归属段位置出现字母 => 纯 hex 资源 id 方案(常见英文轨), 无归属段可校验
-        return True
-    return True
+        # 归属段位置出现字母 => 纯 hex 资源 id 方案(常见英文轨)。
+        # 生产请求同时带 owner_mid 时，必须至少有字幕作者归属信息。
+        return owner_mid is None or track.get("author_mid") is not None
+    return owner_mid is None or track.get("author_mid") is not None
 
 
 # 链接末尾容易被一起复制进来的中英文标点(成对括号的右半等)
@@ -384,6 +399,7 @@ class BiliClient:
         info = {
             "bvid": d["bvid"], "aid": d["aid"], "cid": d["cid"],
             "title": d["title"], "owner": d["owner"]["name"],
+            "owner_mid": d["owner"].get("mid"),
             "duration": d["duration"], "tname": d.get("tname", ""),
             "pic": d.get("pic", ""),
             "pages": [{"page": p["page"], "cid": p["cid"], "part": p["part"],
@@ -395,12 +411,13 @@ class BiliClient:
         return info
 
     def get_subtitle_list(self, bvid: str | None, aid: int | None, cid: int,
-                          on_log=None, force_refresh: bool = False) -> list[dict]:
+                          on_log=None, owner_mid: int | None = None,
+                          force_refresh: bool = False) -> list[dict]:
         """字幕列表对高频请求敏感(实测频控时会随机返回 0/1/2 条), 且 player/v2
         会概率性返回*其他视频*的字幕轨。策略:
         1. 只用 bvid 形式查询(aid 形式实测几乎必然串到其他视频, av 号链接在
            view 接口之后也能拿到规范 bvid);
-        2. 每轮按资源 id 做归属校验, 整轮全部轨通过才采用, 否则退避重试;
+        2. 每轮按资源 id 做归属校验; 发现串轨立即抛专用异常, 供编排层回退到 ASR;
         3. 仅把校验通过的结果落盘缓存, 读到历史脏缓存自动丢弃重拉。"""
         def log(m):
             if on_log:
@@ -419,8 +436,9 @@ class BiliClient:
             try:
                 cached = json.loads(cf.read_text(encoding="utf-8"))
                 if (isinstance(cached, list) and cached
-                        and all(track_belongs_to_video(t, aid, cid) for t in cached)):
-                    unique = { _track_key(t): t for t in cached if _track_key(t) }
+                        and all(track_belongs_to_video(t, aid, cid, owner_mid)
+                                for t in cached)):
+                    unique = {_track_key(t): t for t in cached if _track_key(t)}
                     return list(unique.values())
                 log("本地字幕缓存校验未通过(疑似其他视频数据), 重新拉取")
                 cf.unlink(missing_ok=True)
@@ -457,14 +475,15 @@ class BiliClient:
                 _atomic_json_write(cf, verified)
                 return verified
 
-        # 限流空列表 / 串轨都靠退避重试解决; 每轮重新预热视频页
+        # 限流空列表靠退避重试; 每轮重新预热视频页。串轨则立即交给上层 ASR 回退。
         waits = [0, 1, 2]
-        partial: dict[str, dict] = {}
-        saw_foreign_track = False
         for rnd, w in enumerate(waits):
             if w:
                 time.sleep(w)
                 self.prime_video_page(bvid, aid, force=True)
+            # 每轮都必须生成新的缓存键；复用同一个 _ts 会让 CDN 重放
+            # 上一轮的串轨结果，导致本应进入 ASR 的无字幕视频被误判为接口错误。
+            query = f"bvid={bvid}&cid={cid}&_ts={time.time_ns()}"
             # 实测: 附加 web_location 参数会使字幕列表被裁剪, 用最简查询
             # 每一轮必须生成新的缓存破坏参数; 复用同一 URL 会让 CDN
             # 持续返回上一轮的错误字幕列表, 使重试失去意义。
@@ -475,55 +494,17 @@ class BiliClient:
             subs = d.get("subtitle", {}).get("subtitles", []) or []
             if not subs:
                 continue
-            good = [t for t in subs if track_belongs_to_video(t, aid, cid)]
+            good = [t for t in subs if track_belongs_to_video(t, aid, cid, owner_mid)]
             bad = len(subs) - len(good)
             if bad:
-                saw_foreign_track = True
-                log(f"字幕接口返回了其他视频的字幕轨, 正在重试"
-                    f"({rnd + 1}/{len(waits)})")
-            for t in good:
-                partial.setdefault(_track_key(t) or t.get("lan", str(len(partial))), t)
+                log("字幕接口返回了其他视频的字幕轨, 放弃字幕并转入本地 ASR")
+                raise ForeignSubtitleError()
             if good and bad == 0:
-                unique = list(partial.values())
+                unique = list({_track_key(t): t for t in good if _track_key(t)}.values())
                 _atomic_json_write(cf, unique)
                 return unique
 
-        if partial:
-            # 多轮中至少有部分轨(如中文轨)通过校验: 用并集兜底, 不丢可用结果
-            log("部分字幕轨多次重试仍未通过归属校验, 仅导出校验通过的轨")
-            merged = list(partial.values())
-            _atomic_json_write(cf, merged)
-            return merged
-        if saw_foreign_track:
-            # 旧 player/v2 连续串轨时, 现代接口可能只是首轮被限流为空。
-            # 再刷新一次现代接口; 它以 aid+cid 查询, 可提供不依赖旧接口的正确轨道。
-            try:
-                modern = self._get_modern_subtitle_list(bvid, aid, cid)
-            except (BiliError, httpx.HTTPError, ValueError) as exc:
-                modern = []
-                log(f"现代字幕接口刷新失败: {exc}")
-            verified = []
-            seen = set()
-            for track in modern:
-                key = _track_key(track)
-                if (key and key not in seen and track.get("lan")
-                        and track_belongs_to_video(track, aid, cid)):
-                    item = dict(track)
-                    verified.append(item)
-                    seen.add(key)
-            if verified:
-                _atomic_json_write(cf, verified)
-                log("旧接口持续串轨, 已通过现代字幕接口恢复")
-                return verified
-        if not saw_foreign_track:
-            return []
-        if modern_was_empty:
-            raise BiliError(
-                -1,
-                "未找到属于当前视频的可用字幕轨; 旧接口返回的字幕属于其他视频, "
-                "请确认播放器确实显示 CC/AI 字幕后再重试",
-            )
-        raise BiliError(-1, "字幕接口多次返回其他视频的数据, 请稍后重试")
+        return []
 
     def invalidate_subtitle_cache(self, bvid: str | None, aid: int | None,
                                   cid: int) -> None:

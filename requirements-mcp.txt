@@ -1,0 +1,2 @@
+# Optional stdio MCP integration for local AI clients.
+mcp==1.30.0

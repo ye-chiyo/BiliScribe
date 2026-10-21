@@ -102,7 +102,8 @@ def cmd_extract(args):
     mgr = JobManager()
     job_id = mgr.create(urls_text, fmts=args.fmts.split(","),
                         pages_spec=args.pages, langs=args.langs.split(","),
-                        out_dir=args.out)
+                        out_dir=args.out, asr_enabled=args.asr in ("local", "force"),
+                        force_asr=args.asr == "force")
     job = mgr.get(job_id)
     seen = 0
     while job["status"] in ("queued", "running"):
@@ -138,6 +139,9 @@ def cmd_web(args):
     import uvicorn
     from .web.server import create_app
 
+    # Web UI opts into the local fallback by default; an explicit false keeps
+    # lightweight subtitle-only deployments available.
+    os.environ.setdefault("BILISCRIBE_ASR_ENABLED", "true")
     app = create_app()
     port = _find_free_port(args.port)
     if port != args.port:
@@ -164,6 +168,8 @@ def build_parser():
     pe.add_argument("--pages", default="all", help="分P: all 或 1,3,5-8")
     pe.add_argument("--langs", default="zh", help="语言代码, 默认 zh")
     pe.add_argument("--out", default=None, help="输出目录")
+    pe.add_argument("--asr", choices=("off", "local", "force"), default="off",
+                    help="本地 Paraformer: local=仅无字幕时回退, force=跳过字幕直接转写")
     pe.set_defaults(func=cmd_extract)
 
     pw = sub.add_parser("web", help="启动本地网页控制台")

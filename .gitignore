@@ -37,3 +37,7 @@ Thumbs.db
 .idea/
 .vscode/
 .preview/
+
+# Local test and browser automation artifacts
+.tmp/
+.playwright-cli/

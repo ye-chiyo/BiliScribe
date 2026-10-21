@@ -1,0 +1,13 @@
+# Optional local Paraformer ASR stack for Windows x64.
+# Install the matching PyTorch/torchaudio wheel first; CUDA wheels are
+# selected separately because the correct CUDA build depends on the driver.
+funasr==1.4.16
+
+# CPU fallback installation (use only when CUDA is unavailable):
+# python -m pip install torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+
+# CUDA 12.8 (RTX 4060 Laptop / driver 572.83) install command used for the
+# verified GPU path. The large torch wheel is downloaded separately so it can
+# be resumed with curl when the network interrupts:
+# python -m pip install torch==2.11.0+cu128 torchaudio==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+# python -m pip install -r requirements-asr.txt
