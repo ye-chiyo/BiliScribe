@@ -102,11 +102,13 @@ async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
       });
       release();
       if (!response.ok && !(options.redirect === 'manual' && [301, 302, 303, 307, 308].includes(response.status)))
-        throw new Error(`B站请求失败 (${response.status})`);
+        throw subtitleError(response.status === 429 ? 'rate_limited'
+          : [401, 403].includes(response.status) ? 'auth_required' : 'network_error',
+        `B站请求失败 (${response.status})`);
       return response;
     } catch (error) {
       if (typeof release === 'function') release();
-      lastError = error;
+      lastError = error.reason ? error : subtitleError('network_error', 'B站接口请求失败，请稍后重试。');
       if (attempt < TRANSIENT_RETRIES) await new Promise(resolve => setTimeout(resolve, 400 * (2 ** attempt)));
     }
   }
@@ -115,8 +117,13 @@ async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
 
 async function biliJson(url, cookies = {}, referer = ORIGIN) {
   const response = await biliGet(url, cookies, referer);
-  const payload = await response.json();
-  if (payload.code !== 0) throw new Error(payload.message || `B站接口错误 ${payload.code}`);
+  let payload;
+  try { payload = await response.json(); }
+  catch { throw subtitleError('subtitle_parse_error', '字幕接口响应解析失败，请稍后重试。'); }
+  if (payload.code !== 0) throw subtitleError(
+    [-101, -102, -111, -658].includes(payload.code) ? 'auth_required'
+      : [-412, -352, -799, 88008].includes(payload.code) ? 'rate_limited' : 'subtitle_api_error',
+    payload.message || `B站接口错误 ${payload.code}`);
   return payload.data || {};
 }
 
@@ -362,67 +369,71 @@ function belongs(track, aid, cid) {
   return !/^\d+$/.test(head) || head === prefix;
 }
 
+function subtitleError(reason, message) {
+  return Object.assign(new Error(message), { reason });
+}
+
+function rejectionReason(track, aid, cid) {
+  let id;
+  try { id = resourceId(normalizeSubtitleUrl(track.subtitle_url)); }
+  catch { return 'ownership_unverified'; }
+  if (!id || /^[0-9a-f]{32}$/i.test(id)) return 'ownership_unverified';
+  const prefix = `${aid}${cid}`;
+  if (id.startsWith(prefix)) return null;
+  return (/^\d+$/.test(id.slice(0, prefix.length)) || /^\d{20,30}[0-9a-f]{32}$/i.test(id))
+    ? 'ownership_conflict' : 'ownership_unverified';
+}
+
+function validationFailure(reason) {
+  return subtitleError(reason, reason === 'ownership_conflict'
+    ? '字幕接口返回了其他视频的数据'
+    : '已找到字幕轨，但无法验证其属于当前视频；请稍后重试。');
+}
+
 async function subtitleTracks(bvid, aid, cid, cookies) {
   const referer = `https://www.bilibili.com/video/${bvid}`;
   const cacheKey = `tracks:${bvid}:${aid}:${cid}`;
   const cached = cacheRead(cacheKey);
-  if (cached && cached.every(track => belongs(track, aid, cid))) return cached;
-  let modernWasEmpty = false;
+  if (cached && cached.every(track => rejectionReason(track, aid, cid) === null)) return cached;
+  let failure;
+  const accept = tracks => {
+    const good = tracks.filter(track => track.lan && rejectionReason(track, aid, cid) === null);
+    const rejected = tracks.filter(track => !good.includes(track));
+    if (rejected.length) {
+      const reason = rejected.some(track => rejectionReason(track, aid, cid) === 'ownership_conflict')
+        ? 'ownership_conflict' : 'ownership_unverified';
+      if (!failure || reason === 'ownership_conflict') failure = validationFailure(reason);
+    }
+    return uniqueTracks(good);
+  };
   try {
     const response = await biliGet('https://api.bilibili.com/x/v2/subtitle/web/view?' +
       new URLSearchParams({ oid: String(cid), pid: String(aid),
         context_ext: '{"video_type":1}', type: '1', cur_production_type: '0',
         playlist_switch: '0', arc_video_language: 'cmn', preferred_language: 'ai-zh',
-        web_location: '1315873' }),
-    cookies, `https://www.bilibili.com/video/${bvid}`,
-    { headers: { accept: 'application/octet-stream' } });
-    const modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer()));
-    modernWasEmpty = modern.length === 0;
-    const owned = uniqueTracks(modern.filter(track => track.lan && belongs(track, aid, cid)));
-    if (owned.length) {
-      cacheWrite(cacheKey, owned);
-      return owned;
-    }
-  } catch {
-    // Fall back to the JSON endpoint for older player responses.
+        web_location: '1315873' }), cookies, referer,
+      { headers: { accept: 'application/octet-stream' } });
+    let modern;
+    try { modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer())); }
+    catch { throw subtitleError('subtitle_parse_error', '字幕元数据解析失败，请稍后重试。'); }
+    const owned = accept(modern);
+    if (owned.length) { cacheWrite(cacheKey, owned); return owned; }
+  } catch (error) {
+    failure = error.reason ? error : subtitleError('subtitle_api_error', '字幕接口访问失败，请稍后重试。');
   }
-  let sawForeign = false;
   for (const delay of [0, 2000, 5000]) {
     if (delay) await new Promise(resolve => setTimeout(resolve, delay));
-    const data = await biliJson(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}&_ts=${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      cookies, referer);
-    const tracks = data.subtitle?.subtitles || [];
-    if (!tracks.length) continue;
-    const owned = tracks.filter(track => belongs(track, aid, cid));
-    const good = uniqueTracks(owned);
-    sawForeign ||= owned.length !== tracks.length;
-    if (owned.length && owned.length === tracks.length) {
-      cacheWrite(cacheKey, good);
-      return good;
-    }
-  }
-  if (sawForeign) {
     try {
-      const response = await biliGet('https://api.bilibili.com/x/v2/subtitle/web/view?' +
-        new URLSearchParams({ oid: String(cid), pid: String(aid),
-          context_ext: '{"video_type":1}', type: '1', cur_production_type: '0',
-          playlist_switch: '0', arc_video_language: 'cmn', preferred_language: 'ai-zh',
-          web_location: '1315873' }),
-      cookies, referer, { headers: { accept: 'application/octet-stream' } });
-      const modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer()));
-      const recovered = uniqueTracks(modern.filter(track => track.lan && belongs(track, aid, cid)));
-      if (recovered.length) {
-        cacheWrite(cacheKey, recovered);
-        return recovered;
-      }
-    } catch {
-      // Keep the explicit foreign-track error when the modern endpoint cannot recover.
+      const data = await biliJson(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}&_ts=${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        cookies, referer);
+      const tracks = data.subtitle?.subtitles || [];
+      const owned = accept(tracks);
+      if (owned.length) { cacheWrite(cacheKey, owned); return owned; }
+    } catch (error) {
+      failure ||= error;
     }
   }
-  if (sawForeign && modernWasEmpty) {
-    throw new Error('未找到属于当前视频的可用字幕轨; 旧接口返回的字幕属于其他视频, 请确认播放器确实显示 CC/AI 字幕后再重试');
-  }
-  if (sawForeign) throw new Error('字幕接口多次返回其他视频的字幕轨，请稍后重试');
+  if (failure) throw failure;
   return [];
 }
 
@@ -506,10 +517,12 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
   if (pages.length > MAX_PAGES) throw new Error(`云端单次最多处理 ${MAX_PAGES} 个分 P，请缩小范围`);
   const result = { url: rawUrl, bvid: info.bvid, title: info.title, owner: info.owner?.name || '',
     pic: info.pic || '', duration: info.duration || 0, pages_total: info.pages.length,
-    pages_done: 0, tracks: 0, files: [], no_subtitle_pages: [], empty_body_pages: [], status: 'ok' };
+    pages_done: 0, tracks: 0, files: [], no_subtitle_pages: [], subtitle_absent_pages: [],
+    empty_body_pages: [], status: 'ok' };
   for (const pageNumber of pages) {
     const page = info.pages.find(item => item.page === pageNumber);
     let tracks = await subtitleTracks(info.bvid, info.aid, page.cid, cookies);
+    if (!tracks.length) result.subtitle_absent_pages.push(pageNumber);
     if (!langs.some(lang => String(lang).trim().toLowerCase() === 'all'))
       tracks = tracks.filter(track => languageMatches(track.lan, langs));
     if (!tracks.length) result.no_subtitle_pages.push(pageNumber);
@@ -544,8 +557,16 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
   }
   if (!result.files.length) {
     result.status = 'no_subtitle';
-    if (result.empty_body_pages.length && !result.no_subtitle_pages.length)
+    if (result.empty_body_pages.length) {
+      result.reason = 'subtitle_body_empty';
       result.message = '已找到所选语言字幕轨, 但字幕正文接口暂时返回空内容; 请稍后重试。';
+    } else if (result.no_subtitle_pages.some(page => !result.subtitle_absent_pages.includes(page))) {
+      result.reason = 'language_unavailable';
+      result.message = '已找到字幕轨，但没有所选语言。';
+    } else {
+      result.reason = 'subtitle_absent';
+      result.message = '字幕接口未返回 CC/AI 字幕轨。';
+    }
   }
   return result;
 }
@@ -563,7 +584,8 @@ async function extract(request, env) {
   const results = [];
   for (const url of urls) {
     try { results.push(await extractOne(url, fmts, input.pages || 'all', langs, session.cookies)); }
-    catch (error) { results.push({ url, status: 'error', message: String(error.message || error), files: [] }); }
+    catch (error) { results.push({ url, status: 'error', reason: error.reason || 'subtitle_api_error',
+      message: String(error.message || error), files: [] }); }
   }
   return json({ results });
 }

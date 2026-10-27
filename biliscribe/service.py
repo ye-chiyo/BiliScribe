@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import subtitles as subs_mod
 from .asr import AsrEngine, AudioSource, ParaformerEngine, segments_to_body
-from .api import (BiliClient, BiliError, ForeignSubtitleError, extract_urls,
+from .api import (BiliClient, BiliError, extract_urls,
                   parse_video_url)
 from .auth import OUTPUT_DIR, get_client
 
@@ -114,17 +114,12 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
         if force_asr:
             all_tracks = []
         else:
-            try:
-                subtitle_kwargs = {"on_log": log}
-                # 保持兼容旧版客户端/mock，同时生产路径带 UP 主归属校验。
-                if info.get("owner_mid") is not None:
-                    subtitle_kwargs["owner_mid"] = info["owner_mid"]
-                all_tracks = client.get_subtitle_list(
-                    bvid, info["aid"], page["cid"], **subtitle_kwargs)
-            except ForeignSubtitleError:
-                all_tracks = []
-                result["subtitle_mismatch_pages"].append(pno)
-                log(f"  {label}: 字幕归属不匹配, 立即使用本地 ASR")
+            subtitle_kwargs = {"on_log": log}
+            if info.get("owner_mid") is not None:
+                subtitle_kwargs["owner_mid"] = info["owner_mid"]
+            # Validation failure is an error, never evidence that no subtitle exists.
+            all_tracks = client.get_subtitle_list(
+                bvid, info["aid"], page["cid"], **subtitle_kwargs)
         tracks = _pick_tracks(all_tracks, langs)
         if force_asr or not all_tracks:
             result["subtitle_absent_pages"].append(pno)
@@ -224,8 +219,15 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
         result["status"] = "partial" if result["files"] else "asr_error"
     elif not result["files"]:
         result["status"] = "no_subtitle"
-        if result["empty_body_pages"] and not result["no_subtitle_pages"]:
+        if result["empty_body_pages"]:
+            result["reason"] = "subtitle_body_empty"
             result["message"] = "已找到所选语言字幕轨, 但字幕正文接口暂时返回空内容; 请稍后重试。"
+        elif any(p not in result["subtitle_absent_pages"] for p in result["no_subtitle_pages"]):
+            result["reason"] = "language_unavailable"
+            result["message"] = "已找到字幕轨，但没有所选语言。"
+        else:
+            result["reason"] = "subtitle_absent"
+            result["message"] = "字幕接口未返回 CC/AI 字幕轨。"
     return result
 
 
@@ -343,7 +345,8 @@ class JobManager:
                             self._log(job, f"  -> 已导出 {len(r['files'])} 个文件")
                     except BiliError as e:
                         self._log(job, f"  !! 接口错误: {e}")
-                        job["results"].append({"url": u, "status": "error", "message": str(e),
+                        job["results"].append({"url": u, "status": "error", "reason": e.reason,
+                                               "message": str(e),
                                                "files": []})
                     except Exception as e:
                         self._log(job, f"  !! 异常: {e}")
