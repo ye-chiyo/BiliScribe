@@ -170,8 +170,8 @@ test('empty modern metadata explains foreign legacy tracks', async () => {
     assert.equal(extracted.status, 200);
     const result = (await extracted.json()).results[0];
     assert.equal(result.status, 'error');
-    assert.match(result.message, /未找到属于当前视频的可用字幕轨/);
-    assert.match(result.message, /播放器确实显示/);
+    assert.equal(result.reason, 'ownership_conflict');
+    assert.match(result.message, /其他视频/);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -198,17 +198,28 @@ def parse_web_subtitle_response(payload: bytes) -> list[dict]:
 
 
 class BiliError(Exception):
-    def __init__(self, code: int, message: str):
+    def __init__(self, code: int, message: str, *, reason: str | None = None):
         super().__init__(f"[{code}] {message}")
         self.code = code
         self.message = message
+        self.reason = reason or ("auth_required" if code in AUTH_ERRORS else
+                                 "rate_limited" if code in RATE_ERRORS else
+                                 "subtitle_api_error")
 
 
 class ForeignSubtitleError(BiliError):
     """字幕接口返回了可确认属于其他视频的字幕轨。"""
 
     def __init__(self, message: str = "字幕接口返回了其他视频的数据"):
-        super().__init__(-1001, message)
+        super().__init__(-1001, message, reason="ownership_conflict")
+
+
+class UnverifiedSubtitleError(BiliError):
+    """A track exists, but the available evidence cannot establish ownership."""
+
+    def __init__(self):
+        super().__init__(-1002, "已找到字幕轨，但无法验证其属于当前视频；请稍后重试。",
+                         reason="ownership_unverified")
 
 
 def subtitle_resource_id(subtitle_url: str) -> str:
@@ -261,6 +272,31 @@ def track_belongs_to_video(track: dict, aid: int | None, cid: int,
         # 生产请求同时带 owner_mid 时，必须至少有字幕作者归属信息。
         return owner_mid is None or track.get("author_mid") is not None
     return owner_mid is None or track.get("author_mid") is not None
+
+
+def track_rejection_reason(track: dict, aid: int | None, cid: int,
+                           owner_mid: int | None = None) -> str | None:
+    """Separate an explicit identity conflict from missing ownership evidence."""
+    if owner_mid is not None and track.get("author_mid") is not None:
+        try:
+            if int(track["author_mid"]) != int(owner_mid):
+                return "ownership_conflict"
+        except (TypeError, ValueError):
+            return "ownership_unverified"
+    try:
+        url = normalize_subtitle_url(track.get("subtitle_url", ""))
+    except BiliError:
+        return "ownership_unverified"
+    rid = subtitle_resource_id(url)
+    if not rid or re.fullmatch(r"[0-9a-fA-F]{32}", rid):
+        return "ownership_unverified"
+    if aid:
+        prefix = f"{aid}{cid}"
+        if rid.startswith(prefix):
+            return None
+        if rid[:len(prefix)].isdigit() or re.fullmatch(r"\d{20,30}[0-9a-fA-F]{32}", rid):
+            return "ownership_conflict"
+    return "ownership_unverified"
 
 
 # 链接末尾容易被一起复制进来的中英文标点(成对括号的右半等)
@@ -368,6 +404,7 @@ class BiliClient:
                 d = r.json()
                 code = d.get("code", 0)
                 if code in RATE_ERRORS:
+                    last_exc = BiliError(code, "B站接口限流，请稍后重试。")
                     wait = 0.6 * (2 ** attempt) + random.random() * 0.25
                     time.sleep(wait)
                     continue
@@ -380,7 +417,9 @@ class BiliClient:
                     self._reconnect()
                 if attempt < min(retries, TRANSIENT_RETRIES):
                     time.sleep(0.5 * (2 ** attempt))
-        raise BiliError(-1, f"请求失败: {last_exc}")
+        if isinstance(last_exc, BiliError):
+            raise last_exc
+        raise BiliError(-1, "B站接口请求失败，请稍后重试。", reason="network_error")
 
     def resolve(self, url: str) -> str:
         """展开 b23.tv 短链, 返回最终 URL。"""
@@ -417,7 +456,7 @@ class BiliClient:
         会概率性返回*其他视频*的字幕轨。策略:
         1. 只用 bvid 形式查询(aid 形式实测几乎必然串到其他视频, av 号链接在
            view 接口之后也能拿到规范 bvid);
-        2. 每轮按资源 id 做归属校验; 发现串轨立即抛专用异常, 供编排层回退到 ASR;
+        2. 每轮按资源 id 做归属校验; 区分明确冲突与证据不足，并向编排层保留错误;
         3. 仅把校验通过的结果落盘缓存, 读到历史脏缓存自动丢弃重拉。"""
         def log(m):
             if on_log:
@@ -436,7 +475,7 @@ class BiliClient:
             try:
                 cached = json.loads(cf.read_text(encoding="utf-8"))
                 if (isinstance(cached, list) and cached
-                        and all(track_belongs_to_video(t, aid, cid, owner_mid)
+                        and all(track_rejection_reason(t, aid, cid, owner_mid) is None
                                 for t in cached)):
                     unique = {_track_key(t): t for t in cached if _track_key(t)}
                     return list(unique.values())
@@ -454,36 +493,44 @@ class BiliClient:
 
         # 当前播放器对部分视频只通过 Protobuf 接口返回完整 AI 轨道。
         # 仍须从解码后的资源 ID 校验 aid/cid, 通过后才进入缓存。
-        modern_was_empty = False
+        failure = None
         try:
             modern = self._get_modern_subtitle_list(bvid, aid, cid)
-            modern_was_empty = not modern
         except (BiliError, httpx.HTTPError, ValueError) as exc:
             modern = []
-            log(f"现代字幕接口不可用, 回退旧接口: {exc}")
+            if isinstance(exc, BiliError):
+                failure = exc
+            elif isinstance(exc, httpx.HTTPError):
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                reason = ("auth_required" if status in (401, 403) else
+                          "rate_limited" if status == 429 else "network_error")
+                failure = BiliError(-1, "字幕接口访问失败，请稍后重试。", reason=reason)
+            else:
+                failure = BiliError(-1, "字幕元数据解析失败，请稍后重试。", reason="subtitle_parse_error")
+            log(f"现代字幕接口不可用, 回退旧接口: {failure.message}")
         if modern:
             verified = []
             seen = set()
             for track in modern:
                 key = _track_key(track)
                 if (key and key not in seen and track.get("lan")
-                        and track_belongs_to_video(track, aid, cid)):
+                        and track_rejection_reason(track, aid, cid, owner_mid) is None):
                     item = dict(track)
                     verified.append(item)
                     seen.add(key)
             if verified:
                 _atomic_json_write(cf, verified)
                 return verified
+            reasons = [track_rejection_reason(t, aid, cid, owner_mid) for t in modern]
+            failure = (ForeignSubtitleError() if "ownership_conflict" in reasons
+                       else UnverifiedSubtitleError())
 
-        # 限流空列表靠退避重试; 每轮重新预热视频页。串轨则立即交给上层 ASR 回退。
+        # 限流空列表靠退避重试; 每轮重新预热视频页。验证失败不得转为无字幕。
         waits = [0, 1, 2]
         for rnd, w in enumerate(waits):
             if w:
                 time.sleep(w)
                 self.prime_video_page(bvid, aid, force=True)
-            # 每轮都必须生成新的缓存键；复用同一个 _ts 会让 CDN 重放
-            # 上一轮的串轨结果，导致本应进入 ASR 的无字幕视频被误判为接口错误。
-            query = f"bvid={bvid}&cid={cid}&_ts={time.time_ns()}"
             # 实测: 附加 web_location 参数会使字幕列表被裁剪, 用最简查询
             # 每一轮必须生成新的缓存破坏参数; 复用同一 URL 会让 CDN
             # 持续返回上一轮的错误字幕列表, 使重试失去意义。
@@ -494,16 +541,21 @@ class BiliClient:
             subs = d.get("subtitle", {}).get("subtitles", []) or []
             if not subs:
                 continue
-            good = [t for t in subs if track_belongs_to_video(t, aid, cid, owner_mid)]
+            good = [t for t in subs if track_rejection_reason(t, aid, cid, owner_mid) is None]
             bad = len(subs) - len(good)
             if bad:
-                log("字幕接口返回了其他视频的字幕轨, 放弃字幕并转入本地 ASR")
-                raise ForeignSubtitleError()
+                if any(track_rejection_reason(t, aid, cid, owner_mid) == "ownership_conflict"
+                       for t in subs):
+                    log("字幕接口返回了明确不属于当前视频的字幕轨")
+                    raise ForeignSubtitleError()
+                raise UnverifiedSubtitleError()
             if good and bad == 0:
                 unique = list({_track_key(t): t for t in good if _track_key(t)}.values())
                 _atomic_json_write(cf, unique)
                 return unique
 
+        if failure is not None:
+            raise failure
         return []
 
     def invalidate_subtitle_cache(self, bvid: str | None, aid: int | None,
@@ -560,7 +612,9 @@ class BiliClient:
                         self.prime_video_page(bvid, None, force=True)
                     if attempt < TRANSIENT_RETRIES:
                         time.sleep(0.5 * (2 ** attempt))
-                    continue
+                        continue
+                    raise BiliError(-1, "字幕正文访问失败，请刷新字幕后重试。",
+                                    reason="subtitle_api_error")
                 r.raise_for_status()
                 body = r.json().get("body", []) or []
                 if body:
@@ -571,10 +625,12 @@ class BiliClient:
                     time.sleep(0.5 * (2 ** attempt))
                     continue
                 break
-            except (httpx.HTTPError, ValueError):
+            except (httpx.HTTPError, ValueError) as exc:
                 self._reconnect()
-                if attempt == 2:
-                    body = []
+                if attempt == TRANSIENT_RETRIES:
+                    raise BiliError(-1, "字幕正文接口请求失败，请稍后重试。",
+                                    reason="network_error" if isinstance(exc, httpx.HTTPError)
+                                    else "subtitle_parse_error") from None
                 if attempt < TRANSIENT_RETRIES:
                     time.sleep(0.5 * (2 ** attempt))
         # 只有实际拿到正文才缓存; 空响应必须允许下一次提取重新请求。
