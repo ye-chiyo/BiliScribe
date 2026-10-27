@@ -100,10 +100,8 @@ def v2_data(*tracks):
     return {"subtitle": {"subtitles": list(tracks)}}
 
 
-def test_foreign_track_is_reported_immediately():
-    h = _Harness([
-        v2_data(t(ZH_BAD)),
-    ])
+def test_foreign_track_is_reported_after_bounded_retries():
+    h = _Harness([v2_data(t(ZH_BAD))] * 3)
     try:
         logs = []
         try:
@@ -112,7 +110,7 @@ def test_foreign_track_is_reported_immediately():
             pass
         else:
             raise AssertionError("串轨字幕必须触发专用异常")
-        assert len(h.calls) == 1
+        assert len(h.calls) == 3
         # 只允许 bvid 形式, 不得回退 aid 形式
         assert all("aid=" not in u for u in h.calls), h.calls
         assert all("_ts=" in u for u in h.calls), h.calls
@@ -128,7 +126,7 @@ def test_foreign_track_is_reported_immediately():
 
 
 def test_all_rounds_bad_raises():
-    h = _Harness([v2_data(t(ZH_BAD))])
+    h = _Harness([v2_data(t(ZH_BAD))] * 3)
     try:
         raised = False
         try:
@@ -137,7 +135,7 @@ def test_all_rounds_bad_raises():
             raised = True
             assert "其他视频" in e.message
         assert raised
-        assert len(h.calls) == 1
+        assert len(h.calls) == 3
         # 全部失败时不得写缓存
         cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
         assert not (Path(h.tmp.name) / f"{cache_key}_list.json").exists()
@@ -272,7 +270,7 @@ def test_unknown_encoded_subtitle_url_is_rejected():
     print("[PASS] 未知编码字幕地址被拒绝")
 def test_foreign_track_remains_validation_error():
     """确认串轨后保留专用异常，不当作空字幕或继续导出。"""
-    h = _Harness([v2_data(t(ZH_BAD))])
+    h = _Harness([v2_data(t(ZH_BAD))] * 3)
     try:
         try:
             h.client.get_subtitle_list(BVID, AID, CID)
@@ -280,7 +278,7 @@ def test_foreign_track_remains_validation_error():
             pass
         else:
             raise AssertionError("串轨字幕必须保留归属冲突异常")
-        assert len(h.calls) == 1
+        assert len(h.calls) == 3
     finally:
         h.close()
     print("[PASS] 确认串轨后保留归属冲突异常")
@@ -403,7 +401,7 @@ def test_stale_empty_body_cache_is_discarded():
 
 if __name__ == "__main__":
     test_track_owner_check()
-    test_foreign_track_is_reported_immediately()
+    test_foreign_track_is_reported_after_bounded_retries()
     test_all_rounds_bad_raises()
     test_dirty_cache_discarded()
     test_empty_then_success()
