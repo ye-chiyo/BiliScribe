@@ -38,10 +38,11 @@ function protobufTracks(tracks) {
 }
 
 async function extractionScenario({ legacy = [], modern = new Uint8Array([10, 0]), modernStatus = 200,
-                                    legacyCode = 0, modernTracks, body = [], fmts = ['md'] } = {}) {
+                                    legacyCode = 0, modernTracks, body = [], fmts = ['md'], repeat = 1, bodyStatus = 200, info, inputs, beforeExtract } = {}) {
   const bvid = `BVTEST${String(++scenarioNumber).padStart(6, '0')}`;
   const external = globalThis.fetch;
   const timer = globalThis.setTimeout;
+  const originalNow = Date.now;
   const requests = [];
   globalThis.setTimeout = (callback, _delay, ...args) => timer(callback, 0, ...args);
   globalThis.fetch = async url => {
@@ -51,21 +52,24 @@ async function extractionScenario({ legacy = [], modern = new Uint8Array([10, 0]
       data: { qrcode_key: 'mock-ownership-qr', url: 'https://passport.bilibili.com/mock' } });
     if (parsed.pathname.endsWith('/qrcode/poll')) return new Response(JSON.stringify({ code: 0, data: { code: 0 } }), {
       headers: [['set-cookie', 'SESSDATA=mock-ownership-session; Path=/; HttpOnly']] });
-    if (parsed.pathname === '/x/web-interface/view') return responseJson({ code: 0, data: {
+    if (parsed.pathname === '/x/web-interface/view') return responseJson({ code: 0, data: info ? info(parsed, bvid) : {
       bvid, aid: 117505221724658, title: 'AI 观众提问', owner: { name: 'UP', mid: 123 },
       pages: [{ page: 1, cid: 43061546452, part: '正片' }], duration: 824,
     } });
     if (parsed.pathname === '/x/v2/subtitle/web/view') {
-      assert.equal(parsed.searchParams.get('pid'), '117505221724658');
-      assert.equal(parsed.searchParams.get('oid'), '43061546452');
-      return new Response(modernTracks ? protobufTracks(modernTracks) : modern, { status: modernStatus });
+      if (!info) {
+        assert.equal(parsed.searchParams.get('pid'), '117505221724658');
+        assert.equal(parsed.searchParams.get('oid'), '43061546452');
+      }
+      return new Response(modernTracks ? protobufTracks(typeof modernTracks === 'function' ? modernTracks(parsed) : modernTracks) : modern, { status: modernStatus });
     }
     if (parsed.pathname === '/x/player/v2') return responseJson({ code: legacyCode,
       message: 'mock API failure', data: { subtitle: { subtitles: legacy } } });
     if (parsed.hostname === 'www.bilibili.com') return new Response('<html></html>');
     if (parsed.pathname === '/x/frontend/finger/spi') return responseJson({ code: 0,
       data: { b_3: 'mock-device3', b_4: 'mock-device4' } });
-    if (parsed.hostname === 'aisubtitle.hdslb.com') return responseJson({ body });
+    if (parsed.hostname === 'aisubtitle.hdslb.com') return new Response(JSON.stringify({ body: typeof body === 'function' ? body(parsed) : body }),
+      { status: typeof bodyStatus === 'function' ? bodyStatus(parsed) : bodyStatus, headers: { 'content-type': 'application/json' } });
     throw new Error(`Unexpected external request: ${parsed.hostname}${parsed.pathname}`);
   };
   try {
@@ -76,15 +80,21 @@ async function extractionScenario({ legacy = [], modern = new Uint8Array([10, 0]
     }), env);
     const session = polled.headers.getSetCookie().find(value => value.startsWith('bs_auth='))
       .split(';', 1)[0];
+    const results = [];
+    for (let index = 0; index < (inputs?.length || repeat); index++) {
+    beforeExtract?.(index);
     const response = await worker.fetch(request('/api/extract', {
       method: 'POST', headers: { origin, cookie: session, 'content-type': 'application/json' },
-      body: JSON.stringify({ urls: `https://www.bilibili.com/video/${bvid}/`, fmts }),
+      body: JSON.stringify({ urls: `https://www.bilibili.com/video/${bvid}/`, fmts, ...(typeof inputs?.[index] === 'function' ? inputs[index](bvid) : inputs?.[index]) }),
     }), env);
     assert.equal(response.status, 200);
-    return { result: (await response.json()).results[0], requests };
+    results.push((await response.json()).results[0]);
+    }
+    return { result: results.at(-1), results, requests };
   } finally {
     globalThis.fetch = external;
     globalThis.setTimeout = timer;
+    Date.now = originalNow;
   }
 }
 
@@ -199,4 +209,87 @@ test('legacy author conflict cannot be overridden by matching resource prefix', 
   assert.equal(result.status, 'error');
   assert.equal(result.reason, 'ownership_conflict');
   assert.ok(requests.every(url => url.hostname !== 'aisubtitle.hdslb.com'));
+});
+
+
+test('repeat extraction reuses source-bound opaque metadata and body', async () => {
+  const { results, requests } = await extractionScenario({ repeat: 2,
+    modernTracks: [{ lan: 'ai-zh', subtitle_url: encodedTrackUrl() }],
+    body: [{ from: 1, to: 2, content: 'cached sample' }] });
+  assert.deepEqual(results.map(result => result.status), ['ok', 'ok']);
+  assert.equal(requests.filter(url => url.pathname === '/x/v2/subtitle/web/view').length, 1);
+  assert.equal(requests.filter(url => url.hostname === 'aisubtitle.hdslb.com').length, 1);
+  assert.match(results[1].files[0].content, /cached sample/);
+});
+
+
+for (const oldStatus of [200, 403]) test(`signature or empty body ${oldStatus} refreshes metadata once before export`, async () => {
+  let metadataCalls = 0;
+  const { result } = await extractionScenario({
+    modernTracks: () => [{ lan: 'ai-zh', subtitle_url: encodedTrackUrl().replace('mock-signature', ++metadataCalls === 1 ? 'old' : 'new') }],
+    bodyStatus: url => url.searchParams.get('auth_key') === 'old' ? oldStatus : 200,
+    body: url => url.searchParams.get('auth_key') === 'old' ? [] : [{ from: 1, to: 2, content: 'refreshed signature' }], fmts: ['txt'],
+  });
+  assert.equal(result.status, 'ok');
+  assert.equal(result.files[0].content, 'refreshed signature');
+  assert.equal(metadataCalls, 2);
+});
+
+
+test('same opaque resource is isolated across videos and pages with five formats', async () => {
+  let currentVideo, firstVideo, currentCid;
+  const { results, requests } = await extractionScenario({
+    info: (url, bvid) => {
+      firstVideo ||= bvid;
+      currentVideo = url.searchParams.get('bvid') || bvid;
+      return { bvid: currentVideo, aid: 117505221724658, title: 'format/test',
+        owner: { name: 'UP', mid: 123 }, duration: 10,
+        pages: [{ page: 1, cid: 43061546452, part: 'one' }, { page: 2, cid: 43061546453, part: 'two' }] };
+    },
+    modernTracks: url => {
+      currentCid = url.searchParams.get('oid');
+      return [{ lan: 'ai-zh', subtitle_url: encodedTrackUrl() },
+        { lan: 'ai-en', subtitle_url: encodedTrackUrl('f'.repeat(32)) }];
+    },
+    body: () => [{ from: 1.9996, to: 3.0001, content: currentVideo !== firstVideo ? 'video two page one'
+      : currentCid === '43061546453' ? 'video one page two' : 'video one page one' }],
+    fmts: ['srt', 'vtt', 'txt', 'json', 'md'],
+    inputs: [{ pages: '1' }, { pages: '1' }, { pages: '2' },
+      { urls: 'https://www.bilibili.com/video/BV11gYd6UEPv/?p=1' },
+      { urls: 'https://www.bilibili.com/video/BV11gYd6UEPv/?p=1', langs: ['all'] },
+      { urls: 'https://www.bilibili.com/video/BV11gYd6UEPv/?p=1', langs: ['en'] }],
+  });
+  const texts = ['video one page one', 'video one page one', 'video one page two', 'video two page one'];
+  results.slice(0, 4).forEach((result, index) => {
+    assert.equal(result.status, 'ok');
+    assert.equal(result.files.length, 5);
+    const formats = Object.fromEntries(result.files.map(file => [file.format, file.content]));
+    const text = texts[index];
+    assert.equal(formats.txt, text);
+    assert.equal(formats.srt, `1\n00:00:02,000 --> 00:00:03,000\n${text}\n`);
+    assert.equal(formats.vtt, `WEBVTT\n\n00:00:02.000 --> 00:00:03.000\n${text}\n`);
+    assert.equal(JSON.parse(formats.json).body[0].content, text);
+    assert.ok(formats.md.includes(`**[0:01]** ${text}`));
+  });
+  assert.equal(results[4].tracks, 2);
+  assert.equal(results[5].tracks, 1);
+  assert.ok(results[5].files.every(file => file.name.includes('.ai-en.')));
+  assert.equal(requests.filter(url => url.pathname === '/x/v2/subtitle/web/view').length, 3);
+  assert.equal(requests.filter(url => url.hostname === 'aisubtitle.hdslb.com').length, 4);
+});
+
+
+for (const shift of [25 * 3600_000, -3600_000]) test(`expired or future proof is requeried after clock shift ${shift}`, async () => {
+  const start = Date.now();
+  let available = true;
+  const { results, requests } = await extractionScenario({ repeat: 2,
+    beforeExtract: index => { if (index) { available = false; Date.now = () => start + shift; } },
+    modernTracks: () => available ? [{ lan: 'ai-zh', subtitle_url: encodedTrackUrl() }] : [],
+    body: [{ from: 1, to: 2, content: 'initial valid' }],
+  });
+  assert.equal(results[0].status, 'ok');
+  assert.equal(results[1].status, 'no_subtitle');
+  assert.deepEqual(results[1].files, []);
+  assert.equal(requests.filter(url => url.pathname === '/x/v2/subtitle/web/view').length, 2);
+  assert.equal(requests.filter(url => url.hostname === 'aisubtitle.hdslb.com').length, 1);
 });

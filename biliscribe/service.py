@@ -173,7 +173,14 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
                                       owner_mid=info.get("owner_mid"))
             return client.fetch_subtitle(track["subtitle_url"], bvid)
         for t in tracks:
-            body = fetch_track(t)
+            signature_failure = None
+            try:
+                body = fetch_track(t)
+            except BiliError as exc:
+                if exc.reason != "subtitle_signature_expired" or refreshed_tracks is not None:
+                    raise
+                signature_failure = exc
+                body = []
             if not body and refreshed_tracks is None:
                 invalidate = getattr(client, "invalidate_subtitle_cache", None)
                 if not callable(invalidate):
@@ -192,6 +199,8 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
                     if body:
                         t = candidate
                         break
+            if signature_failure is not None and not refreshed_tracks:
+                raise signature_failure
             if not body:
                 page_had_empty_body = True
                 continue

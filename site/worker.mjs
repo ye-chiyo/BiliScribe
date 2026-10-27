@@ -102,9 +102,9 @@ async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
       });
       release();
       if (!response.ok && !(options.redirect === 'manual' && [301, 302, 303, 307, 308].includes(response.status)))
-        throw subtitleError(response.status === 429 ? 'rate_limited'
+        throw Object.assign(subtitleError(response.status === 429 ? 'rate_limited'
           : [401, 403].includes(response.status) ? 'auth_required' : 'network_error',
-        `B站请求失败 (${response.status})`);
+        `B站请求失败 (${response.status})`), { httpStatus: response.status });
       return response;
     } catch (error) {
       if (typeof release === 'function') release();
@@ -378,7 +378,7 @@ function opaqueResource(track) {
   } catch { return false; }
 }
 
-const SUBTITLE_POLICY_VERSION = 1;
+const SUBTITLE_POLICY_VERSION = 2;
 const trackApprovals = new WeakMap();
 
 function trackFingerprint(track) {
@@ -386,10 +386,10 @@ function trackFingerprint(track) {
     ...['id', 'id_str', 'lan', 'author_mid'].map(key => String(track[key] ?? ''))]);
 }
 
-function approveTrack(track, bvid, aid, cid, source) {
+function approveTrack(track, bvid, aid, cid, source, approvedAt = Date.now()) {
   const item = { ...track };
   trackApprovals.set(item, Object.freeze({ bvid, aid, cid, source,
-    fingerprint: trackFingerprint(item), approvedAt: Date.now(), version: SUBTITLE_POLICY_VERSION }));
+    fingerprint: trackFingerprint(item), approvedAt, version: SUBTITLE_POLICY_VERSION }));
   return item;
 }
 
@@ -401,7 +401,7 @@ function validateTrack(track, bvid, aid, cid, ownerMid) {
   try { fingerprint = trackFingerprint(track); }
   catch { throw validationFailure('ownership_unverified'); }
   if (!approval || approval.bvid !== bvid || approval.aid !== aid || approval.cid !== cid ||
-      approval.version !== SUBTITLE_POLICY_VERSION || Date.now() - approval.approvedAt >= CACHE_TTL_MS ||
+      approval.version !== SUBTITLE_POLICY_VERSION || !(Date.now() - approval.approvedAt >= 0 && Date.now() - approval.approvedAt < CACHE_TTL_MS) ||
       approval.fingerprint !== fingerprint || authorRejectionReason(track, ownerMid) ||
       (reason && !(approval.source === 'modern' && opaqueResource(track))))
     throw validationFailure('ownership_unverified');
@@ -427,12 +427,39 @@ function validationFailure(reason) {
     : '已找到字幕轨，但无法验证其属于当前视频；请稍后重试。');
 }
 
+function trackEnvelope(tracks, bvid, aid, cid) {
+  return { version: SUBTITLE_POLICY_VERSION, bvid, aid, cid, entries: tracks.map(track => {
+    const proof = trackApprovals.get(track);
+    return { track: { ...track }, source: proof.source, context: [proof.bvid, proof.aid, proof.cid], fingerprint: proof.fingerprint,
+      approvedAt: proof.approvedAt };
+  }) };
+}
+
+function restoreTracks(cached, bvid, aid, cid, ownerMid) {
+  if (!cached || cached.version !== SUBTITLE_POLICY_VERSION || cached.bvid !== bvid ||
+      cached.aid !== aid || cached.cid !== cid || !Array.isArray(cached.entries) || !cached.entries.length)
+    return [];
+  try {
+    for (const entry of cached.entries) {
+      const { track, source, approvedAt, fingerprint } = entry;
+      const age = Date.now() - approvedAt;
+      if (!track?.lan || JSON.stringify(entry.context) !== JSON.stringify([bvid, aid, cid]) ||
+          !['modern', 'legacy'].includes(source) ||
+          typeof approvedAt !== 'number' || !Number.isFinite(approvedAt) || !(age >= 0 && age < CACHE_TTL_MS) ||
+          fingerprint !== trackFingerprint(track) || authorRejectionReason(track, ownerMid) ||
+          (rejectionReason(track, aid, cid, ownerMid) && !(source === 'modern' && opaqueResource(track))))
+        return [];
+    }
+    return cached.entries.map(entry => approveTrack(entry.track, bvid, aid, cid, entry.source, entry.approvedAt));
+  } catch { return []; }
+}
+
 async function subtitleTracks(bvid, aid, cid, cookies, ownerMid) {
   const referer = `https://www.bilibili.com/video/${bvid}`;
   const cacheKey = `tracks:${bvid}:${aid}:${cid}`;
   const cached = cacheRead(cacheKey);
-  if (cached && cached.every(track => rejectionReason(track, aid, cid, ownerMid) === null))
-    return cached.map(track => approveTrack(track, bvid, aid, cid, 'resource'));
+  const restored = restoreTracks(cached, bvid, aid, cid, ownerMid);
+  if (restored.length) return restored;
   let failure;
   const accept = (tracks, source) => {
     const good = tracks.filter(track => track.lan && (rejectionReason(track, aid, cid, ownerMid) === null ||
@@ -457,8 +484,7 @@ async function subtitleTracks(bvid, aid, cid, cookies, ownerMid) {
     catch { throw subtitleError('subtitle_parse_error', '字幕元数据解析失败，请稍后重试。'); }
     const owned = accept(modern, 'modern');
     if (owned.length) {
-      // Source-bound opaque tracks remain request-local until durable envelope migration.
-      if (!owned.some(opaqueResource)) cacheWrite(cacheKey, owned);
+      cacheWrite(cacheKey, trackEnvelope(owned, bvid, aid, cid));
       return owned;
     }
   } catch (error) {
@@ -471,7 +497,7 @@ async function subtitleTracks(bvid, aid, cid, cookies, ownerMid) {
         cookies, referer);
       const tracks = data.subtitle?.subtitles || [];
       const owned = accept(tracks, 'legacy');
-      if (owned.length) { cacheWrite(cacheKey, owned); return owned; }
+      if (owned.length) { cacheWrite(cacheKey, trackEnvelope(owned, bvid, aid, cid)); return owned; }
     } catch (error) {
       failure ||= error;
     }
@@ -502,16 +528,23 @@ async function primeSession(cookies, bvid) {
 async function subtitleBody(track, bvid, aid, cid, cookies, ownerMid) {
   validateTrack(track, bvid, aid, cid, ownerMid);
   const absolute = new URL(normalizeSubtitleUrl(track.subtitle_url));
-  const key = `body:${resourceId(absolute.href)}`;
-  const cacheable = !opaqueResource(track);
-  const cached = cacheable && cacheRead(key);
+  const key = `body:${JSON.stringify([bvid, aid, cid, absolute.origin + absolute.pathname])}`;
+  const cached = cacheRead(key);
   if (cached) return cached;
-  const response = await biliGet(absolute.href, cookies,
-    `https://www.bilibili.com/video/${bvid}`);
-  const data = await response.json();
+  let response;
+  try {
+    response = await biliGet(absolute.href, cookies, `https://www.bilibili.com/video/${bvid}`);
+  } catch (error) {
+    if (error.httpStatus === 403)
+      throw subtitleError('subtitle_signature_expired', '字幕正文访问失败，请刷新字幕后重试。');
+    throw error;
+  }
+  let data;
+  try { data = await response.json(); }
+  catch { throw subtitleError('subtitle_parse_error', '字幕正文解析失败，请稍后重试。'); }
   const body = Array.isArray(data.body) ? data.body : [];
   validateTrack(track, bvid, aid, cid, ownerMid);
-  if (body.length && cacheable) cacheWrite(key, body);
+  if (body.length) cacheWrite(key, body);
   return body;
 }
 
@@ -575,7 +608,13 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
     let pageHadEmptyBody = false;
     let refreshedTracks = null;
     for (let track of tracks) {
-      let body = await subtitleBody(track, info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
+      let body, signatureFailure;
+      try { body = await subtitleBody(track, info.bvid, info.aid, page.cid, cookies, info.owner?.mid); }
+      catch (error) {
+        if (error.reason !== 'subtitle_signature_expired' || refreshedTracks !== null) throw error;
+        signatureFailure = error;
+        body = [];
+      }
       if (!body.length && refreshedTracks === null) {
         const fresh = await refreshSubtitleTracks(info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
         refreshedTracks = fresh.filter(candidate => candidate.lan === track.lan);
@@ -587,6 +626,7 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
           }
         }
       }
+      if (signatureFailure && !refreshedTracks?.length) throw signatureFailure;
       if (!body.length) { pageHadEmptyBody = true; continue; }
       const lan = track.lan || 'unk';
       const meta = { title: info.title, owner: result.owner, bvid: info.bvid,
@@ -621,7 +661,7 @@ async function extract(request, env) {
   const session = await unseal(readCookie(request, COOKIE_NAME), env);
   if (!session?.cookies?.SESSDATA) return json({ error: 'not_logged_in' }, 401);
   const input = await request.json();
-  const urls = String(input.urls || '').match(/https?:\/\/[^\s,，;；。！？!?、）)】」』》"'’”…]+/g) || [];
+  const urls = String(input.urls || '').match(/https?:\/\/[^\s,，;；。！？!、）)】」』》"'’”…]+/g) || [];
   if (!urls.length || urls.length > MAX_URLS) return json({ error: `请输入 1–${MAX_URLS} 个 B站视频链接` }, 400);
   const fmts = [...new Set(Array.isArray(input.fmts) ? input.fmts : ['md'])];
   if (!fmts.length || fmts.some(fmt => !['srt', 'vtt', 'txt', 'json', 'md'].includes(fmt)))
