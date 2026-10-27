@@ -23,7 +23,7 @@ CACHE_TTL = 24 * 3600  # 字幕缓存 24 小时, 避免重复请求触发频控
 CONNECT_TIMEOUT = 8.0
 READ_TIMEOUT = 12.0
 TRANSIENT_RETRIES = 2
-SUBTITLE_POLICY_VERSION = 1
+SUBTITLE_POLICY_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -315,7 +315,7 @@ _URL_TAIL_PUNCT = ".,;:!?，。；：！？、）)】」』》>\"'’”…·"
 def extract_urls(text: str) -> list[str]:
     """从一段文本(支持换行/逗号分隔多个链接)中提取 B 站视频 URL。"""
     # 中文句读/成对右括号直接视为链接边界, 避免尾随标点污染短链
-    urls = re.findall(r"https?://[^\s,，;；。！？!?、）)】」』》\"'’”…]+", text)
+    urls = re.findall(r"https?://[^\s,，;；。！？!、）)】」』》\"'’”…]+", text)
     out = []
     for u in urls:
         u = u.rstrip(_URL_TAIL_PUNCT)
@@ -488,7 +488,7 @@ class BiliClient:
             raise UnverifiedSubtitleError() from None
         approval = self._track_approvals.get((bvid, aid, cid, fingerprint))
         if (approval is None or approval.policy_version != SUBTITLE_POLICY_VERSION
-                or time.time() - approval.approved_at >= CACHE_TTL
+                or not 0 <= time.time() - approval.approved_at < CACHE_TTL
                 or _author_rejection_reason(track, owner_mid) is not None
                 or (reason is not None and not (
                     approval.source == "modern" and _opaque_resource(track)))):
@@ -499,9 +499,50 @@ class BiliClient:
                     owner_mid: int | None = None) -> list[dict]:
         """Download only a track approved for this video's selected page."""
         self.validate_track(track, bvid, aid, cid, owner_mid)
-        body = self.fetch_subtitle(track["subtitle_url"], bvid)
+        body = self.fetch_subtitle(track["subtitle_url"], bvid, cache_scope=(bvid, aid, cid))
         self.validate_track(track, bvid, aid, cid, owner_mid)
         return body
+
+    def _cache_tracks(self, path: Path, tracks: list[dict], bvid: str,
+                      aid: int | None, cid: int) -> None:
+        entries = []
+        for track in tracks:
+            fingerprint = _track_fingerprint(track)
+            proof = self._track_approvals[(bvid, aid, cid, fingerprint)]
+            entries.append({"track": track, "source": proof.source,
+                            "context": [proof.bvid, proof.aid, proof.cid],
+                            "fingerprint": fingerprint, "approved_at": proof.approved_at})
+        _atomic_json_write(path, {"version": SUBTITLE_POLICY_VERSION,
+            "bvid": bvid, "aid": aid, "cid": cid, "entries": entries})
+
+    def _restore_tracks(self, cached, bvid: str, aid: int | None, cid: int,
+                        owner_mid: int | None) -> list[dict]:
+        # Serialized proofs are consistency records, not signatures against local tampering.
+        if (not isinstance(cached, dict) or cached.get("version") != SUBTITLE_POLICY_VERSION
+                or (cached.get("bvid"), cached.get("aid"), cached.get("cid")) != (bvid, aid, cid)
+                or not isinstance(cached.get("entries"), list) or not cached["entries"]):
+            return []
+        restored = []
+        try:
+            for entry in cached["entries"]:
+                track, source, stamp = entry["track"], entry["source"], entry["approved_at"]
+                if (not isinstance(track, dict) or not track.get("lan")
+                        or entry.get("context") != [bvid, aid, cid]
+                        or source not in ("modern", "legacy")
+                        or not isinstance(stamp, (int, float)) or isinstance(stamp, bool)
+                        or not 0 <= time.time() - stamp < CACHE_TTL):
+                    return []
+                fingerprint = _track_fingerprint(track)
+                reason = track_rejection_reason(track, aid, cid, owner_mid)
+                if (fingerprint != entry["fingerprint"] or _author_rejection_reason(track, owner_mid)
+                        or (reason is not None and not (source == "modern" and _opaque_resource(track)))):
+                    return []
+                restored.append((dict(track), SubtitleApproval(source, bvid, aid, cid, fingerprint, stamp)))
+        except (KeyError, TypeError, ValueError, BiliError):
+            return []
+        for track, proof in restored:
+            self._track_approvals[(bvid, aid, cid, proof.fingerprint)] = proof
+        return list({_track_key(track): track for track, _ in restored}.values())
 
     def get_subtitle_list(self, bvid: str | None, aid: int | None, cid: int,
                           on_log=None, owner_mid: int | None = None,
@@ -528,12 +569,9 @@ class BiliClient:
         if not force_refresh and _cache_fresh(cf):
             try:
                 cached = json.loads(cf.read_text(encoding="utf-8"))
-                if (isinstance(cached, list) and cached
-                        and all(track_rejection_reason(t, aid, cid, owner_mid) is None
-                                for t in cached)):
-                    unique = {_track_key(t): t for t in cached if _track_key(t)}
-                    return self._approve_tracks(list(unique.values()), bvid, aid, cid,
-                                                owner_mid, "resource")
+                restored = self._restore_tracks(cached, bvid, aid, cid, owner_mid)
+                if restored:
+                    return restored
                 log("本地字幕缓存校验未通过(疑似其他视频数据), 重新拉取")
                 cf.unlink(missing_ok=True)
             except (json.JSONDecodeError, OSError):
@@ -566,10 +604,7 @@ class BiliClient:
         if modern:
             verified = self._approve_tracks(modern, bvid, aid, cid, owner_mid, "modern")
             if verified:
-                # Opaque approvals currently live only in this client's request
-                # registry. Ticket 03 adds a versioned durable source envelope.
-                if not any(_opaque_resource(t) for t in verified):
-                    _atomic_json_write(cf, verified)
+                self._cache_tracks(cf, verified, bvid, aid, cid)
                 return verified
             reasons = [track_rejection_reason(t, aid, cid, owner_mid) for t in modern]
             failure = (ForeignSubtitleError() if "ownership_conflict" in reasons
@@ -595,8 +630,9 @@ class BiliClient:
             bad = len(subs) - len(good)
             if good:
                 unique = list({_track_key(t): t for t in good if _track_key(t)}.values())
-                _atomic_json_write(cf, unique)
-                return self._approve_tracks(unique, bvid, aid, cid, owner_mid, "legacy")
+                approved = self._approve_tracks(unique, bvid, aid, cid, owner_mid, "legacy")
+                self._cache_tracks(cf, approved, bvid, aid, cid)
+                return approved
             if bad:
                 if any(track_rejection_reason(t, aid, cid, owner_mid) == "ownership_conflict"
                        for t in subs):
@@ -632,14 +668,18 @@ class BiliClient:
         response.raise_for_status()
         return parse_web_subtitle_response(response.content)
 
-    def fetch_subtitle(self, subtitle_url: str, bvid: str) -> list[dict]:
+    def fetch_subtitle(self, subtitle_url: str, bvid: str, *,
+                       cache_scope: tuple | None = None) -> list[dict]:
         """Low-level download; production exports must use fetch_track approval."""
         subtitle_url = normalize_subtitle_url(subtitle_url)
         # 缓存键用稳定资源 id(含 aid+cid 归属段), 不含时效 auth_key:
         # 既避免同轨反复下载, 又天然隔离不同视频
         rid = subtitle_resource_id(subtitle_url)
-        cacheable = re.fullmatch(r"[0-9a-fA-F]{32}", rid) is None
-        h = hashlib.md5(rid.encode()).hexdigest()[:16]
+        cacheable = cache_scope is not None or re.fullmatch(r"[0-9a-fA-F]{32}", rid) is None
+        parsed = urlsplit(subtitle_url)
+        stable_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        h = (hashlib.sha256(json.dumps([*cache_scope, stable_url]).encode()).hexdigest()[:24]
+             if cache_scope is not None else hashlib.md5(rid.encode()).hexdigest()[:16])
         cf = CACHE_DIR / f"{h}_body.json"
         if cacheable and _cache_fresh(cf):
             try:
@@ -666,7 +706,7 @@ class BiliClient:
                         time.sleep(0.5 * (2 ** attempt))
                         continue
                     raise BiliError(-1, "字幕正文访问失败，请刷新字幕后重试。",
-                                    reason="subtitle_api_error")
+                                    reason="subtitle_signature_expired")
                 r.raise_for_status()
                 body = r.json().get("body", []) or []
                 if body:
