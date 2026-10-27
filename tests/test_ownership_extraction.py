@@ -50,7 +50,8 @@ def protobuf_tracks(tracks):
 
 @contextmanager
 def extraction_client(tmp_path, *, legacy=(), modern=b"\x0a\x00", modern_status=200,
-                      legacy_code=0, body=None, body_status=200, info=None):
+                      legacy_code=0, legacy_status=200, legacy_raw=None,
+                      body=None, body_status=200, info=None):
     requests = []
 
     def respond(request):
@@ -71,9 +72,11 @@ def extraction_client(tmp_path, *, legacy=(), modern=b"\x0a\x00", modern_status=
                 assert request.url.params['oid'] == str(CID)
             return httpx.Response(modern_status, content=modern(request) if callable(modern) else modern)
         if path == "/x/player/v2":
-            return httpx.Response(200, json={"code": legacy_code,
+            if legacy_raw is not None:
+                return httpx.Response(legacy_status, text=legacy_raw)
+            return httpx.Response(legacy_status, json={"code": legacy_code,
                 "message": "mock API failure",
-                "data": {"subtitle": {"subtitles": list(legacy)}}})
+                "data": {"subtitle": {"subtitles": list(legacy(request) if callable(legacy) else legacy)}}})
         if request.url.host == "aisubtitle.hdslb.com":
             return httpx.Response(body_status(request) if callable(body_status) else body_status, json={"body": body(request) if callable(body) else body or []})
         raise AssertionError(f"Unexpected external request: {request.url.host}{path}")
@@ -343,3 +346,50 @@ def test_cached_opaque_evidence_survives_new_client_without_renewing_proof(tmp_p
     assert Path(result['files'][0]).read_text(encoding='utf-8') == 'persisted sample'
     assert not any(request.url.path == '/x/v2/subtitle/web/view' or
                    request.url.host == 'aisubtitle.hdslb.com' for request in requests)
+
+
+def test_legacy_transient_unverified_track_can_recover(tmp_path):
+    responses = iter([
+        [{'lan': 'ai-zh', 'subtitle_url': encoded_track_url()}],
+        [{'lan': 'ai-zh', 'subtitle_url': f'//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/{AID}{CID}fixture'}],
+    ])
+    with extraction_client(tmp_path, legacy=lambda _: next(responses),
+                           body=[{'from': 0, 'to': 1, 'content': '重试取得正确字幕'}]) as (client, _):
+        result = extract(client, tmp_path)
+    assert result['status'] == 'ok'
+    assert Path(result['files'][0]).read_text(encoding='utf-8') == '重试取得正确字幕'
+
+
+def test_modern_conflict_survives_legacy_http_failure(tmp_path):
+    track = {'lan': 'ai-zh', 'subtitle_url':
+             '//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/11337329541521726472939880ffffffffffffffffffffffffffffffff'}
+    with extraction_client(tmp_path, modern=protobuf_tracks([track]), legacy_status=503) as (client, requests):
+        with pytest.raises(BiliError) as raised:
+            extract(client, tmp_path)
+    assert raised.value.reason == 'ownership_conflict'
+    assert all(request.url.host != 'aisubtitle.hdslb.com' for request in requests)
+
+
+@pytest.mark.parametrize('status, reason', [(401, 'auth_required'), (429, 'rate_limited')])
+def test_body_http_failure_retains_specific_reason(tmp_path, status, reason):
+    track = {'lan': 'ai-zh', 'subtitle_url': encoded_track_url()}
+    with extraction_client(tmp_path, modern=protobuf_tracks([track]), body_status=status) as (client, _):
+        with pytest.raises(BiliError) as raised:
+            extract(client, tmp_path)
+    assert raised.value.reason == reason
+    assert not list((tmp_path / 'exports').glob('*'))
+
+
+@pytest.mark.parametrize('status, raw, reason', [
+    (401, '{}', 'auth_required'),
+    (429, '{}', 'rate_limited'),
+    (200, '{broken', 'subtitle_parse_error'),
+    (200, '{}', 'subtitle_api_error'),
+])
+def test_legacy_http_and_payload_failures_are_not_absent_subtitles(tmp_path, status, raw, reason):
+    with extraction_client(tmp_path, legacy_status=status, legacy_raw=raw) as (client, requests):
+        with pytest.raises(BiliError) as raised:
+            extract(client, tmp_path)
+    assert raised.value.reason == reason
+    assert not list((tmp_path / 'exports').glob('*'))
+    assert all(request.url.host != 'aisubtitle.hdslb.com' for request in requests)

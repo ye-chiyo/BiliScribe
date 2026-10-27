@@ -235,6 +235,15 @@ class UnverifiedSubtitleError(BiliError):
                          reason="ownership_unverified")
 
 
+def _request_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response.status_code in (401, 403):
+            return "auth_required"
+        if exc.response.status_code == 429:
+            return "rate_limited"
+    return "network_error" if isinstance(exc, httpx.HTTPError) else "subtitle_parse_error"
+
+
 def subtitle_resource_id(subtitle_url: str) -> str:
     """Return a stable resource id for legacy and encoded subtitle URLs."""
     raw = str(subtitle_url or "")
@@ -411,15 +420,19 @@ class BiliClient:
         for attempt in range(min(retries, TRANSIENT_RETRIES) + 1):
             try:
                 r = self.client.get(url, headers={"Referer": referer})
+                r.raise_for_status()
                 d = r.json()
-                code = d.get("code", 0)
+                if not isinstance(d, dict):
+                    raise ValueError("invalid API response")
+                code = d.get("code")
                 if code in RATE_ERRORS:
                     last_exc = BiliError(code, "B站接口限流，请稍后重试。")
                     wait = 0.6 * (2 ** attempt) + random.random() * 0.25
                     time.sleep(wait)
                     continue
                 if code != 0:
-                    raise BiliError(code, d.get("message", "未知错误"))
+                    raise BiliError(code if isinstance(code, int) else -1,
+                                    d.get("message", "未知错误"))
                 return d.get("data", {})
             except (httpx.HTTPError, ValueError) as e:
                 last_exc = e
@@ -429,7 +442,8 @@ class BiliClient:
                     time.sleep(0.5 * (2 ** attempt))
         if isinstance(last_exc, BiliError):
             raise last_exc
-        raise BiliError(-1, "B站接口请求失败，请稍后重试。", reason="network_error")
+        raise BiliError(-1, "B站接口请求失败，请稍后重试。",
+                        reason=_request_failure_reason(last_exc)) from None
 
     def resolve(self, url: str) -> str:
         """展开 b23.tv 短链, 返回最终 URL。"""
@@ -594,10 +608,8 @@ class BiliClient:
             if isinstance(exc, BiliError):
                 failure = exc
             elif isinstance(exc, httpx.HTTPError):
-                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-                reason = ("auth_required" if status in (401, 403) else
-                          "rate_limited" if status == 429 else "network_error")
-                failure = BiliError(-1, "字幕接口访问失败，请稍后重试。", reason=reason)
+                failure = BiliError(-1, "字幕接口访问失败，请稍后重试。",
+                                    reason=_request_failure_reason(exc))
             else:
                 failure = BiliError(-1, "字幕元数据解析失败，请稍后重试。", reason="subtitle_parse_error")
             log(f"现代字幕接口不可用, 回退旧接口: {failure.message}")
@@ -620,9 +632,14 @@ class BiliClient:
             # 每一轮必须生成新的缓存破坏参数; 复用同一 URL 会让 CDN
             # 持续返回上一轮的错误字幕列表, 使重试失去意义。
             query = f"bvid={bvid}&cid={cid}&_ts={time.time_ns()}-{rnd}"
-            d = self._get_json(
-                f"https://api.bilibili.com/x/player/v2?{query}",
-                referer=f"https://www.bilibili.com/video/{bvid}")
+            try:
+                d = self._get_json(
+                    f"https://api.bilibili.com/x/player/v2?{query}",
+                    referer=f"https://www.bilibili.com/video/{bvid}")
+            except BiliError as exc:
+                if failure is None:
+                    failure = exc
+                continue
             subs = d.get("subtitle", {}).get("subtitles", []) or []
             if not subs:
                 continue
@@ -637,8 +654,9 @@ class BiliClient:
                 if any(track_rejection_reason(t, aid, cid, owner_mid) == "ownership_conflict"
                        for t in subs):
                     log("字幕接口返回了明确不属于当前视频的字幕轨")
-                    raise ForeignSubtitleError()
-                raise UnverifiedSubtitleError()
+                    failure = ForeignSubtitleError()
+                elif failure is None:
+                    failure = UnverifiedSubtitleError()
 
         if failure is not None:
             raise failure
@@ -721,8 +739,7 @@ class BiliClient:
                 self._reconnect()
                 if attempt == TRANSIENT_RETRIES:
                     raise BiliError(-1, "字幕正文接口请求失败，请稍后重试。",
-                                    reason="network_error" if isinstance(exc, httpx.HTTPError)
-                                    else "subtitle_parse_error") from None
+                                    reason=_request_failure_reason(exc)) from None
                 if attempt < TRANSIENT_RETRIES:
                     time.sleep(0.5 * (2 ** attempt))
         # 只有实际拿到正文才缓存; 空响应必须允许下一次提取重新请求。

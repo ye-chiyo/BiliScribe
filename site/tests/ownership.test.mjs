@@ -38,7 +38,7 @@ function protobufTracks(tracks) {
 }
 
 async function extractionScenario({ legacy = [], modern = new Uint8Array([10, 0]), modernStatus = 200,
-                                    legacyCode = 0, modernTracks, body = [], fmts = ['md'], repeat = 1, bodyStatus = 200, info, inputs, beforeExtract } = {}) {
+                                    legacyCode = 0, legacyStatus = 200, legacyRaw, modernTracks, body = [], fmts = ['md'], repeat = 1, bodyStatus = 200, info, inputs, beforeExtract } = {}) {
   const bvid = `BVTEST${String(++scenarioNumber).padStart(6, '0')}`;
   const external = globalThis.fetch;
   const timer = globalThis.setTimeout;
@@ -63,8 +63,9 @@ async function extractionScenario({ legacy = [], modern = new Uint8Array([10, 0]
       }
       return new Response(modernTracks ? protobufTracks(typeof modernTracks === 'function' ? modernTracks(parsed) : modernTracks) : modern, { status: modernStatus });
     }
-    if (parsed.pathname === '/x/player/v2') return responseJson({ code: legacyCode,
-      message: 'mock API failure', data: { subtitle: { subtitles: legacy } } });
+    if (parsed.pathname === '/x/player/v2') return new Response(legacyRaw ?? JSON.stringify({ code: legacyCode,
+      message: 'mock API failure', data: { subtitle: { subtitles: typeof legacy === 'function' ? legacy(parsed) : legacy } } }),
+      { status: legacyStatus, headers: { 'content-type': 'application/json' } });
     if (parsed.hostname === 'www.bilibili.com') return new Response('<html></html>');
     if (parsed.pathname === '/x/frontend/finger/spi') return responseJson({ code: 0,
       data: { b_3: 'mock-device3', b_4: 'mock-device4' } });
@@ -293,3 +294,45 @@ for (const shift of [25 * 3600_000, -3600_000]) test(`expired or future proof is
   assert.equal(requests.filter(url => url.pathname === '/x/v2/subtitle/web/view').length, 2);
   assert.equal(requests.filter(url => url.hostname === 'aisubtitle.hdslb.com').length, 1);
 });
+
+
+test('legacy transient unverified track can recover', async () => {
+  let round = 0;
+  const { result } = await extractionScenario({ legacy: () => [{ lan: 'ai-zh',
+    subtitle_url: ++round === 1 ? encodedTrackUrl()
+      : '//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/11750522172465843061546452fixture' }],
+    body: [{ from: 0, to: 1, content: '重试取得正确字幕' }], fmts: ['txt'] });
+  assert.equal(result.status, 'ok');
+  assert.equal(result.files[0].content, '重试取得正确字幕');
+});
+
+
+test('modern conflict survives legacy HTTP failure', async () => {
+  const { result, requests } = await extractionScenario({ modernTracks: [{ lan: 'ai-zh',
+    subtitle_url: '//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/11337329541521726472939880ffffffffffffffffffffffffffffffff' }],
+    legacyStatus: 503 });
+  assert.equal(result.status, 'error');
+  assert.equal(result.reason, 'ownership_conflict');
+  assert.ok(requests.every(url => url.hostname !== 'aisubtitle.hdslb.com'));
+});
+
+for (const [status, reason] of [[401, 'auth_required'], [429, 'rate_limited']]) {
+  test(`body HTTP ${status} retains specific reason`, async () => {
+    const { result } = await extractionScenario({ modernTracks: [{ lan: 'ai-zh',
+      subtitle_url: encodedTrackUrl() }], bodyStatus: status });
+    assert.equal(result.status, 'error');
+    assert.equal(result.reason, reason);
+    assert.deepEqual(result.files, []);
+  });
+}
+
+for (const [status, raw, reason] of [[401, '{}', 'auth_required'], [429, '{}', 'rate_limited'],
+  [200, '{broken', 'subtitle_parse_error'], [200, '{}', 'subtitle_api_error']]) {
+  test(`legacy HTTP ${status} payload retains ${reason}`, async () => {
+    const { result, requests } = await extractionScenario({ legacyStatus: status, legacyRaw: raw });
+    assert.equal(result.status, 'error');
+    assert.equal(result.reason, reason);
+    assert.deepEqual(result.files, []);
+    assert.ok(requests.every(url => url.hostname !== 'aisubtitle.hdslb.com'));
+  });
+}
