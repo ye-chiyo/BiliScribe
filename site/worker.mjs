@@ -359,21 +359,58 @@ function languageMatches(value, wanted) {
   });
 }
 
-function belongs(track, aid, cid) {
-  const id = resourceId(track.subtitle_url);
-  if (!id) return false;
-  const prefix = `${aid}${cid}`;
-  const lan = String(track.lan || '').toLowerCase();
-  if (/(^|[-_])zh([-_]|$)/.test(lan)) return id.startsWith(prefix);
-  const head = id.slice(0, prefix.length);
-  return !/^\d+$/.test(head) || head === prefix;
-}
-
 function subtitleError(reason, message) {
   return Object.assign(new Error(message), { reason });
 }
 
-function rejectionReason(track, aid, cid) {
+function authorRejectionReason(track, ownerMid) {
+  if (ownerMid !== undefined && ownerMid !== null && track.author_mid !== undefined && track.author_mid !== null) {
+    if (!/^\d+$/.test(String(track.author_mid))) return 'ownership_unverified';
+    if (String(track.author_mid) !== String(ownerMid)) return 'ownership_conflict';
+  }
+  return null;
+}
+
+function opaqueResource(track) {
+  try {
+    const url = normalizeSubtitleUrl(track.subtitle_url);
+    return new URL(url).pathname.startsWith('/bfs/ai_subtitle/prod/') && /^[0-9a-f]{32}$/i.test(resourceId(url));
+  } catch { return false; }
+}
+
+const SUBTITLE_POLICY_VERSION = 1;
+const trackApprovals = new WeakMap();
+
+function trackFingerprint(track) {
+  return JSON.stringify([normalizeSubtitleUrl(track.subtitle_url),
+    ...['id', 'id_str', 'lan', 'author_mid'].map(key => String(track[key] ?? ''))]);
+}
+
+function approveTrack(track, bvid, aid, cid, source) {
+  const item = { ...track };
+  trackApprovals.set(item, Object.freeze({ bvid, aid, cid, source,
+    fingerprint: trackFingerprint(item), approvedAt: Date.now(), version: SUBTITLE_POLICY_VERSION }));
+  return item;
+}
+
+function validateTrack(track, bvid, aid, cid, ownerMid) {
+  const reason = rejectionReason(track, aid, cid, ownerMid);
+  if (reason === 'ownership_conflict') throw validationFailure(reason);
+  const approval = trackApprovals.get(track);
+  let fingerprint;
+  try { fingerprint = trackFingerprint(track); }
+  catch { throw validationFailure('ownership_unverified'); }
+  if (!approval || approval.bvid !== bvid || approval.aid !== aid || approval.cid !== cid ||
+      approval.version !== SUBTITLE_POLICY_VERSION || Date.now() - approval.approvedAt >= CACHE_TTL_MS ||
+      approval.fingerprint !== fingerprint || authorRejectionReason(track, ownerMid) ||
+      (reason && !(approval.source === 'modern' && opaqueResource(track))))
+    throw validationFailure('ownership_unverified');
+  return approval;
+}
+
+function rejectionReason(track, aid, cid, ownerMid) {
+  const authorReason = authorRejectionReason(track, ownerMid);
+  if (authorReason) return authorReason;
   let id;
   try { id = resourceId(normalizeSubtitleUrl(track.subtitle_url)); }
   catch { return 'ownership_unverified'; }
@@ -390,21 +427,23 @@ function validationFailure(reason) {
     : '已找到字幕轨，但无法验证其属于当前视频；请稍后重试。');
 }
 
-async function subtitleTracks(bvid, aid, cid, cookies) {
+async function subtitleTracks(bvid, aid, cid, cookies, ownerMid) {
   const referer = `https://www.bilibili.com/video/${bvid}`;
   const cacheKey = `tracks:${bvid}:${aid}:${cid}`;
   const cached = cacheRead(cacheKey);
-  if (cached && cached.every(track => rejectionReason(track, aid, cid) === null)) return cached;
+  if (cached && cached.every(track => rejectionReason(track, aid, cid, ownerMid) === null))
+    return cached.map(track => approveTrack(track, bvid, aid, cid, 'resource'));
   let failure;
-  const accept = tracks => {
-    const good = tracks.filter(track => track.lan && rejectionReason(track, aid, cid) === null);
+  const accept = (tracks, source) => {
+    const good = tracks.filter(track => track.lan && (rejectionReason(track, aid, cid, ownerMid) === null ||
+      (source === 'modern' && opaqueResource(track) && !authorRejectionReason(track, ownerMid))));
     const rejected = tracks.filter(track => !good.includes(track));
     if (rejected.length) {
-      const reason = rejected.some(track => rejectionReason(track, aid, cid) === 'ownership_conflict')
+      const reason = rejected.some(track => rejectionReason(track, aid, cid, ownerMid) === 'ownership_conflict')
         ? 'ownership_conflict' : 'ownership_unverified';
       if (!failure || reason === 'ownership_conflict') failure = validationFailure(reason);
     }
-    return uniqueTracks(good);
+    return uniqueTracks(good).map(track => approveTrack(track, bvid, aid, cid, source));
   };
   try {
     const response = await biliGet('https://api.bilibili.com/x/v2/subtitle/web/view?' +
@@ -416,8 +455,12 @@ async function subtitleTracks(bvid, aid, cid, cookies) {
     let modern;
     try { modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer())); }
     catch { throw subtitleError('subtitle_parse_error', '字幕元数据解析失败，请稍后重试。'); }
-    const owned = accept(modern);
-    if (owned.length) { cacheWrite(cacheKey, owned); return owned; }
+    const owned = accept(modern, 'modern');
+    if (owned.length) {
+      // Source-bound opaque tracks remain request-local until durable envelope migration.
+      if (!owned.some(opaqueResource)) cacheWrite(cacheKey, owned);
+      return owned;
+    }
   } catch (error) {
     failure = error.reason ? error : subtitleError('subtitle_api_error', '字幕接口访问失败，请稍后重试。');
   }
@@ -427,7 +470,7 @@ async function subtitleTracks(bvid, aid, cid, cookies) {
       const data = await biliJson(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}&_ts=${Date.now()}-${Math.random().toString(36).slice(2)}`,
         cookies, referer);
       const tracks = data.subtitle?.subtitles || [];
-      const owned = accept(tracks);
+      const owned = accept(tracks, 'legacy');
       if (owned.length) { cacheWrite(cacheKey, owned); return owned; }
     } catch (error) {
       failure ||= error;
@@ -437,9 +480,9 @@ async function subtitleTracks(bvid, aid, cid, cookies) {
   return [];
 }
 
-async function refreshSubtitleTracks(bvid, aid, cid, cookies) {
+async function refreshSubtitleTracks(bvid, aid, cid, cookies, ownerMid) {
   cacheDelete(`tracks:${bvid}:${aid}:${cid}`);
-  return subtitleTracks(bvid, aid, cid, cookies);
+  return subtitleTracks(bvid, aid, cid, cookies, ownerMid);
 }
 
 async function primeSession(cookies, bvid) {
@@ -456,16 +499,19 @@ async function primeSession(cookies, bvid) {
   }
 }
 
-async function subtitleBody(url, bvid, cookies) {
-  const absolute = new URL(normalizeSubtitleUrl(url));
+async function subtitleBody(track, bvid, aid, cid, cookies, ownerMid) {
+  validateTrack(track, bvid, aid, cid, ownerMid);
+  const absolute = new URL(normalizeSubtitleUrl(track.subtitle_url));
   const key = `body:${resourceId(absolute.href)}`;
-  const cached = cacheRead(key);
+  const cacheable = !opaqueResource(track);
+  const cached = cacheable && cacheRead(key);
   if (cached) return cached;
   const response = await biliGet(absolute.href, cookies,
     `https://www.bilibili.com/video/${bvid}`);
   const data = await response.json();
   const body = Array.isArray(data.body) ? data.body : [];
-  if (body.length) cacheWrite(key, body);
+  validateTrack(track, bvid, aid, cid, ownerMid);
+  if (body.length && cacheable) cacheWrite(key, body);
   return body;
 }
 
@@ -521,7 +567,7 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
     empty_body_pages: [], status: 'ok' };
   for (const pageNumber of pages) {
     const page = info.pages.find(item => item.page === pageNumber);
-    let tracks = await subtitleTracks(info.bvid, info.aid, page.cid, cookies);
+    let tracks = await subtitleTracks(info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
     if (!tracks.length) result.subtitle_absent_pages.push(pageNumber);
     if (!langs.some(lang => String(lang).trim().toLowerCase() === 'all'))
       tracks = tracks.filter(track => languageMatches(track.lan, langs));
@@ -529,12 +575,12 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
     let pageHadEmptyBody = false;
     let refreshedTracks = null;
     for (let track of tracks) {
-      let body = await subtitleBody(track.subtitle_url, info.bvid, cookies);
+      let body = await subtitleBody(track, info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
       if (!body.length && refreshedTracks === null) {
-        const fresh = await refreshSubtitleTracks(info.bvid, info.aid, page.cid, cookies);
+        const fresh = await refreshSubtitleTracks(info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
         refreshedTracks = fresh.filter(candidate => candidate.lan === track.lan);
         for (const candidate of refreshedTracks) {
-          body = await subtitleBody(candidate.subtitle_url, info.bvid, cookies);
+          body = await subtitleBody(candidate, info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
           if (body.length) {
             track = candidate;
             break;

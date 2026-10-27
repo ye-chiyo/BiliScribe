@@ -44,18 +44,18 @@ def encoded_v2_url(path, auth_key="test-signature", key_index=0):
 def test_track_owner_check():
     assert track_belongs_to_video(t(ZH_GOOD), AID, CID) is True
     assert track_belongs_to_video(t(ZH_BAD), AID, CID) is False
-    # 英文轨纯 hex 资源 id(归属段位置含字母), 无法校验时放行
-    assert track_belongs_to_video(t(EN_GOOD, "ai-en", "English"), AID, CID) is True
+    # Resource-only checks cannot authorize opaque IDs, regardless of language.
+    assert track_belongs_to_video(t(EN_GOOD, "ai-en", "English"), AID, CID) is False
     # 空 URL 拒绝
     assert track_belongs_to_video(t(""), AID, CID) is False
-    # 无 aid 无法校验, 放行(不应误杀)
-    assert track_belongs_to_video(t(ZH_BAD), None, CID) is True
+    # Missing identity is insufficient evidence, never a blanket permission.
+    assert track_belongs_to_video(t(ZH_BAD), None, CID) is False
     assert track_belongs_to_video(
         {**t(EN_GOOD, "ai-en", "English"), "author_mid": 999},
         AID, CID, owner_mid=123) is False
     assert track_belongs_to_video(
         {**t(EN_GOOD, "ai-en", "English"), "author_mid": 123},
-        AID, CID, owner_mid=123) is True
+        AID, CID, owner_mid=123) is False
     assert track_belongs_to_video(
         t(EN_GOOD, "ai-en", "English"), AID, CID, owner_mid=123) is False
 
