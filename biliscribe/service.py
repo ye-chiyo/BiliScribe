@@ -166,8 +166,14 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
             result["no_subtitle_pages"].append(pno)
         page_had_empty_body = False
         refreshed_tracks = None
+        def fetch_track(track):
+            approved_fetch = getattr(client, "fetch_track", None)
+            if callable(approved_fetch):
+                return approved_fetch(track, bvid, info["aid"], page["cid"],
+                                      owner_mid=info.get("owner_mid"))
+            return client.fetch_subtitle(track["subtitle_url"], bvid)
         for t in tracks:
-            body = client.fetch_subtitle(t["subtitle_url"], bvid)
+            body = fetch_track(t)
             if not body and refreshed_tracks is None:
                 invalidate = getattr(client, "invalidate_subtitle_cache", None)
                 if not callable(invalidate):
@@ -176,13 +182,13 @@ def extract_one(client: BiliClient, raw_url: str, fmts: list[str],
                 else:
                     invalidate(bvid, info["aid"], page["cid"])
                     fresh = client.get_subtitle_list(
-                        bvid, info["aid"], page["cid"], on_log=log,
-                        force_refresh=True)
+                        bvid, info["aid"], page["cid"],
+                        **dict(subtitle_kwargs, force_refresh=True))
                 refreshed_tracks = [candidate for candidate in
                                     _pick_tracks(fresh, langs)
                                     if candidate.get("lan") == t.get("lan")]
                 for candidate in refreshed_tracks:
-                    body = client.fetch_subtitle(candidate["subtitle_url"], bvid)
+                    body = fetch_track(candidate)
                     if body:
                         t = candidate
                         break
