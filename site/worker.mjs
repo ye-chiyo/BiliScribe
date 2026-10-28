@@ -102,11 +102,13 @@ async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
       });
       release();
       if (!response.ok && !(options.redirect === 'manual' && [301, 302, 303, 307, 308].includes(response.status)))
-        throw new Error(`B站请求失败 (${response.status})`);
+        throw Object.assign(subtitleError(response.status === 429 ? 'rate_limited'
+          : [401, 403].includes(response.status) ? 'auth_required' : 'network_error',
+        `B站请求失败 (${response.status})`), { httpStatus: response.status });
       return response;
     } catch (error) {
       if (typeof release === 'function') release();
-      lastError = error;
+      lastError = error.reason ? error : subtitleError('network_error', 'B站接口请求失败，请稍后重试。');
       if (attempt < TRANSIENT_RETRIES) await new Promise(resolve => setTimeout(resolve, 400 * (2 ** attempt)));
     }
   }
@@ -115,8 +117,13 @@ async function biliGet(url, cookies = {}, referer = ORIGIN, options = {}) {
 
 async function biliJson(url, cookies = {}, referer = ORIGIN) {
   const response = await biliGet(url, cookies, referer);
-  const payload = await response.json();
-  if (payload.code !== 0) throw new Error(payload.message || `B站接口错误 ${payload.code}`);
+  let payload;
+  try { payload = await response.json(); }
+  catch { throw subtitleError('subtitle_parse_error', '字幕接口响应解析失败，请稍后重试。'); }
+  if (payload.code !== 0) throw subtitleError(
+    [-101, -102, -111, -658].includes(payload.code) ? 'auth_required'
+      : [-412, -352, -799, 88008].includes(payload.code) ? 'rate_limited' : 'subtitle_api_error',
+    payload.message || `B站接口错误 ${payload.code}`);
   return payload.data || {};
 }
 
@@ -352,83 +359,156 @@ function languageMatches(value, wanted) {
   });
 }
 
-function belongs(track, aid, cid) {
-  const id = resourceId(track.subtitle_url);
-  if (!id) return false;
-  const prefix = `${aid}${cid}`;
-  const lan = String(track.lan || '').toLowerCase();
-  if (/(^|[-_])zh([-_]|$)/.test(lan)) return id.startsWith(prefix);
-  const head = id.slice(0, prefix.length);
-  return !/^\d+$/.test(head) || head === prefix;
+function subtitleError(reason, message) {
+  return Object.assign(new Error(message), { reason });
 }
 
-async function subtitleTracks(bvid, aid, cid, cookies) {
+function authorRejectionReason(track, ownerMid) {
+  if (ownerMid !== undefined && ownerMid !== null && track.author_mid !== undefined && track.author_mid !== null) {
+    if (!/^\d+$/.test(String(track.author_mid))) return 'ownership_unverified';
+    if (String(track.author_mid) !== String(ownerMid)) return 'ownership_conflict';
+  }
+  return null;
+}
+
+function opaqueResource(track) {
+  try {
+    const url = normalizeSubtitleUrl(track.subtitle_url);
+    return new URL(url).pathname.startsWith('/bfs/ai_subtitle/prod/') && /^[0-9a-f]{32}$/i.test(resourceId(url));
+  } catch { return false; }
+}
+
+const SUBTITLE_POLICY_VERSION = 2;
+const trackApprovals = new WeakMap();
+
+function trackFingerprint(track) {
+  return JSON.stringify([normalizeSubtitleUrl(track.subtitle_url),
+    ...['id', 'id_str', 'lan', 'author_mid'].map(key => String(track[key] ?? ''))]);
+}
+
+function approveTrack(track, bvid, aid, cid, source, approvedAt = Date.now()) {
+  const item = { ...track };
+  trackApprovals.set(item, Object.freeze({ bvid, aid, cid, source,
+    fingerprint: trackFingerprint(item), approvedAt, version: SUBTITLE_POLICY_VERSION }));
+  return item;
+}
+
+function validateTrack(track, bvid, aid, cid, ownerMid) {
+  const reason = rejectionReason(track, aid, cid, ownerMid);
+  if (reason === 'ownership_conflict') throw validationFailure(reason);
+  const approval = trackApprovals.get(track);
+  let fingerprint;
+  try { fingerprint = trackFingerprint(track); }
+  catch { throw validationFailure('ownership_unverified'); }
+  if (!approval || approval.bvid !== bvid || approval.aid !== aid || approval.cid !== cid ||
+      approval.version !== SUBTITLE_POLICY_VERSION || !(Date.now() - approval.approvedAt >= 0 && Date.now() - approval.approvedAt < CACHE_TTL_MS) ||
+      approval.fingerprint !== fingerprint || authorRejectionReason(track, ownerMid) ||
+      (reason && !(approval.source === 'modern' && opaqueResource(track))))
+    throw validationFailure('ownership_unverified');
+  return approval;
+}
+
+function rejectionReason(track, aid, cid, ownerMid) {
+  const authorReason = authorRejectionReason(track, ownerMid);
+  if (authorReason) return authorReason;
+  let id;
+  try { id = resourceId(normalizeSubtitleUrl(track.subtitle_url)); }
+  catch { return 'ownership_unverified'; }
+  if (!id || /^[0-9a-f]{32}$/i.test(id)) return 'ownership_unverified';
+  const prefix = `${aid}${cid}`;
+  if (id.startsWith(prefix)) return null;
+  return (/^\d+$/.test(id.slice(0, prefix.length)) || /^\d{20,30}[0-9a-f]{32}$/i.test(id))
+    ? 'ownership_conflict' : 'ownership_unverified';
+}
+
+function validationFailure(reason) {
+  return subtitleError(reason, reason === 'ownership_conflict'
+    ? '字幕接口返回了其他视频的数据'
+    : '已找到字幕轨，但无法验证其属于当前视频；请稍后重试。');
+}
+
+function trackEnvelope(tracks, bvid, aid, cid) {
+  return { version: SUBTITLE_POLICY_VERSION, bvid, aid, cid, entries: tracks.map(track => {
+    const proof = trackApprovals.get(track);
+    return { track: { ...track }, source: proof.source, context: [proof.bvid, proof.aid, proof.cid], fingerprint: proof.fingerprint,
+      approvedAt: proof.approvedAt };
+  }) };
+}
+
+function restoreTracks(cached, bvid, aid, cid, ownerMid) {
+  if (!cached || cached.version !== SUBTITLE_POLICY_VERSION || cached.bvid !== bvid ||
+      cached.aid !== aid || cached.cid !== cid || !Array.isArray(cached.entries) || !cached.entries.length)
+    return [];
+  try {
+    for (const entry of cached.entries) {
+      const { track, source, approvedAt, fingerprint } = entry;
+      const age = Date.now() - approvedAt;
+      if (!track?.lan || JSON.stringify(entry.context) !== JSON.stringify([bvid, aid, cid]) ||
+          !['modern', 'legacy'].includes(source) ||
+          typeof approvedAt !== 'number' || !Number.isFinite(approvedAt) || !(age >= 0 && age < CACHE_TTL_MS) ||
+          fingerprint !== trackFingerprint(track) || authorRejectionReason(track, ownerMid) ||
+          (rejectionReason(track, aid, cid, ownerMid) && !(source === 'modern' && opaqueResource(track))))
+        return [];
+    }
+    return cached.entries.map(entry => approveTrack(entry.track, bvid, aid, cid, entry.source, entry.approvedAt));
+  } catch { return []; }
+}
+
+async function subtitleTracks(bvid, aid, cid, cookies, ownerMid) {
   const referer = `https://www.bilibili.com/video/${bvid}`;
   const cacheKey = `tracks:${bvid}:${aid}:${cid}`;
   const cached = cacheRead(cacheKey);
-  if (cached && cached.every(track => belongs(track, aid, cid))) return cached;
-  let modernWasEmpty = false;
+  const restored = restoreTracks(cached, bvid, aid, cid, ownerMid);
+  if (restored.length) return restored;
+  let failure;
+  const accept = (tracks, source) => {
+    const good = tracks.filter(track => track.lan && (rejectionReason(track, aid, cid, ownerMid) === null ||
+      (source === 'modern' && opaqueResource(track) && !authorRejectionReason(track, ownerMid))));
+    const rejected = tracks.filter(track => !good.includes(track));
+    if (rejected.length) {
+      const reason = rejected.some(track => rejectionReason(track, aid, cid, ownerMid) === 'ownership_conflict')
+        ? 'ownership_conflict' : 'ownership_unverified';
+      if (!failure || reason === 'ownership_conflict') failure = validationFailure(reason);
+    }
+    return uniqueTracks(good).map(track => approveTrack(track, bvid, aid, cid, source));
+  };
   try {
     const response = await biliGet('https://api.bilibili.com/x/v2/subtitle/web/view?' +
       new URLSearchParams({ oid: String(cid), pid: String(aid),
         context_ext: '{"video_type":1}', type: '1', cur_production_type: '0',
         playlist_switch: '0', arc_video_language: 'cmn', preferred_language: 'ai-zh',
-        web_location: '1315873' }),
-    cookies, `https://www.bilibili.com/video/${bvid}`,
-    { headers: { accept: 'application/octet-stream' } });
-    const modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer()));
-    modernWasEmpty = modern.length === 0;
-    const owned = uniqueTracks(modern.filter(track => track.lan && belongs(track, aid, cid)));
+        web_location: '1315873' }), cookies, referer,
+      { headers: { accept: 'application/octet-stream' } });
+    let modern;
+    try { modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer())); }
+    catch { throw subtitleError('subtitle_parse_error', '字幕元数据解析失败，请稍后重试。'); }
+    const owned = accept(modern, 'modern');
     if (owned.length) {
-      cacheWrite(cacheKey, owned);
+      cacheWrite(cacheKey, trackEnvelope(owned, bvid, aid, cid));
       return owned;
     }
-  } catch {
-    // Fall back to the JSON endpoint for older player responses.
+  } catch (error) {
+    failure = error.reason ? error : subtitleError('subtitle_api_error', '字幕接口访问失败，请稍后重试。');
   }
-  let sawForeign = false;
   for (const delay of [0, 2000, 5000]) {
     if (delay) await new Promise(resolve => setTimeout(resolve, delay));
-    const data = await biliJson(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}&_ts=${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      cookies, referer);
-    const tracks = data.subtitle?.subtitles || [];
-    if (!tracks.length) continue;
-    const owned = tracks.filter(track => belongs(track, aid, cid));
-    const good = uniqueTracks(owned);
-    sawForeign ||= owned.length !== tracks.length;
-    if (owned.length && owned.length === tracks.length) {
-      cacheWrite(cacheKey, good);
-      return good;
-    }
-  }
-  if (sawForeign) {
     try {
-      const response = await biliGet('https://api.bilibili.com/x/v2/subtitle/web/view?' +
-        new URLSearchParams({ oid: String(cid), pid: String(aid),
-          context_ext: '{"video_type":1}', type: '1', cur_production_type: '0',
-          playlist_switch: '0', arc_video_language: 'cmn', preferred_language: 'ai-zh',
-          web_location: '1315873' }),
-      cookies, referer, { headers: { accept: 'application/octet-stream' } });
-      const modern = parseWebSubtitleResponse(new Uint8Array(await response.arrayBuffer()));
-      const recovered = uniqueTracks(modern.filter(track => track.lan && belongs(track, aid, cid)));
-      if (recovered.length) {
-        cacheWrite(cacheKey, recovered);
-        return recovered;
-      }
-    } catch {
-      // Keep the explicit foreign-track error when the modern endpoint cannot recover.
+      const data = await biliJson(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}&_ts=${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        cookies, referer);
+      const tracks = data.subtitle?.subtitles || [];
+      const owned = accept(tracks, 'legacy');
+      if (owned.length) { cacheWrite(cacheKey, trackEnvelope(owned, bvid, aid, cid)); return owned; }
+    } catch (error) {
+      failure ||= error;
     }
   }
-  if (sawForeign && modernWasEmpty) {
-    throw new Error('未找到属于当前视频的可用字幕轨; 旧接口返回的字幕属于其他视频, 请确认播放器确实显示 CC/AI 字幕后再重试');
-  }
-  if (sawForeign) throw new Error('字幕接口多次返回其他视频的字幕轨，请稍后重试');
+  if (failure) throw failure;
   return [];
 }
 
-async function refreshSubtitleTracks(bvid, aid, cid, cookies) {
+async function refreshSubtitleTracks(bvid, aid, cid, cookies, ownerMid) {
   cacheDelete(`tracks:${bvid}:${aid}:${cid}`);
-  return subtitleTracks(bvid, aid, cid, cookies);
+  return subtitleTracks(bvid, aid, cid, cookies, ownerMid);
 }
 
 async function primeSession(cookies, bvid) {
@@ -445,15 +525,25 @@ async function primeSession(cookies, bvid) {
   }
 }
 
-async function subtitleBody(url, bvid, cookies) {
-  const absolute = new URL(normalizeSubtitleUrl(url));
-  const key = `body:${resourceId(absolute.href)}`;
+async function subtitleBody(track, bvid, aid, cid, cookies, ownerMid) {
+  validateTrack(track, bvid, aid, cid, ownerMid);
+  const absolute = new URL(normalizeSubtitleUrl(track.subtitle_url));
+  const key = `body:${JSON.stringify([bvid, aid, cid, absolute.origin + absolute.pathname])}`;
   const cached = cacheRead(key);
   if (cached) return cached;
-  const response = await biliGet(absolute.href, cookies,
-    `https://www.bilibili.com/video/${bvid}`);
-  const data = await response.json();
+  let response;
+  try {
+    response = await biliGet(absolute.href, cookies, `https://www.bilibili.com/video/${bvid}`);
+  } catch (error) {
+    if (error.httpStatus === 403)
+      throw subtitleError('subtitle_signature_expired', '字幕正文访问失败，请刷新字幕后重试。');
+    throw error;
+  }
+  let data;
+  try { data = await response.json(); }
+  catch { throw subtitleError('subtitle_parse_error', '字幕正文解析失败，请稍后重试。'); }
   const body = Array.isArray(data.body) ? data.body : [];
+  validateTrack(track, bvid, aid, cid, ownerMid);
   if (body.length) cacheWrite(key, body);
   return body;
 }
@@ -506,28 +596,37 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
   if (pages.length > MAX_PAGES) throw new Error(`云端单次最多处理 ${MAX_PAGES} 个分 P，请缩小范围`);
   const result = { url: rawUrl, bvid: info.bvid, title: info.title, owner: info.owner?.name || '',
     pic: info.pic || '', duration: info.duration || 0, pages_total: info.pages.length,
-    pages_done: 0, tracks: 0, files: [], no_subtitle_pages: [], empty_body_pages: [], status: 'ok' };
+    pages_done: 0, tracks: 0, files: [], no_subtitle_pages: [], subtitle_absent_pages: [],
+    empty_body_pages: [], status: 'ok' };
   for (const pageNumber of pages) {
     const page = info.pages.find(item => item.page === pageNumber);
-    let tracks = await subtitleTracks(info.bvid, info.aid, page.cid, cookies);
+    let tracks = await subtitleTracks(info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
+    if (!tracks.length) result.subtitle_absent_pages.push(pageNumber);
     if (!langs.some(lang => String(lang).trim().toLowerCase() === 'all'))
       tracks = tracks.filter(track => languageMatches(track.lan, langs));
     if (!tracks.length) result.no_subtitle_pages.push(pageNumber);
     let pageHadEmptyBody = false;
     let refreshedTracks = null;
     for (let track of tracks) {
-      let body = await subtitleBody(track.subtitle_url, info.bvid, cookies);
+      let body, signatureFailure;
+      try { body = await subtitleBody(track, info.bvid, info.aid, page.cid, cookies, info.owner?.mid); }
+      catch (error) {
+        if (error.reason !== 'subtitle_signature_expired' || refreshedTracks !== null) throw error;
+        signatureFailure = error;
+        body = [];
+      }
       if (!body.length && refreshedTracks === null) {
-        const fresh = await refreshSubtitleTracks(info.bvid, info.aid, page.cid, cookies);
+        const fresh = await refreshSubtitleTracks(info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
         refreshedTracks = fresh.filter(candidate => candidate.lan === track.lan);
         for (const candidate of refreshedTracks) {
-          body = await subtitleBody(candidate.subtitle_url, info.bvid, cookies);
+          body = await subtitleBody(candidate, info.bvid, info.aid, page.cid, cookies, info.owner?.mid);
           if (body.length) {
             track = candidate;
             break;
           }
         }
       }
+      if (signatureFailure && !refreshedTracks?.length) throw signatureFailure;
       if (!body.length) { pageHadEmptyBody = true; continue; }
       const lan = track.lan || 'unk';
       const meta = { title: info.title, owner: result.owner, bvid: info.bvid,
@@ -544,8 +643,16 @@ async function extractOne(rawUrl, fmts, pagesSpec, langs, cookies) {
   }
   if (!result.files.length) {
     result.status = 'no_subtitle';
-    if (result.empty_body_pages.length && !result.no_subtitle_pages.length)
+    if (result.empty_body_pages.length) {
+      result.reason = 'subtitle_body_empty';
       result.message = '已找到所选语言字幕轨, 但字幕正文接口暂时返回空内容; 请稍后重试。';
+    } else if (result.no_subtitle_pages.some(page => !result.subtitle_absent_pages.includes(page))) {
+      result.reason = 'language_unavailable';
+      result.message = '已找到字幕轨，但没有所选语言。';
+    } else {
+      result.reason = 'subtitle_absent';
+      result.message = '字幕接口未返回 CC/AI 字幕轨。';
+    }
   }
   return result;
 }
@@ -554,7 +661,7 @@ async function extract(request, env) {
   const session = await unseal(readCookie(request, COOKIE_NAME), env);
   if (!session?.cookies?.SESSDATA) return json({ error: 'not_logged_in' }, 401);
   const input = await request.json();
-  const urls = String(input.urls || '').match(/https?:\/\/[^\s,，;；。！？!?、）)】」』》"'’”…]+/g) || [];
+  const urls = String(input.urls || '').match(/https?:\/\/[^\s,，;；。！？!、）)】」』》"'’”…]+/g) || [];
   if (!urls.length || urls.length > MAX_URLS) return json({ error: `请输入 1–${MAX_URLS} 个 B站视频链接` }, 400);
   const fmts = [...new Set(Array.isArray(input.fmts) ? input.fmts : ['md'])];
   if (!fmts.length || fmts.some(fmt => !['srt', 'vtt', 'txt', 'json', 'md'].includes(fmt)))
@@ -563,7 +670,8 @@ async function extract(request, env) {
   const results = [];
   for (const url of urls) {
     try { results.push(await extractOne(url, fmts, input.pages || 'all', langs, session.cookies)); }
-    catch (error) { results.push({ url, status: 'error', message: String(error.message || error), files: [] }); }
+    catch (error) { results.push({ url, status: 'error', reason: error.reason || 'subtitle_api_error',
+      message: String(error.message || error), files: [] }); }
   }
   return json({ results });
 }

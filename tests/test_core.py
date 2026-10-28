@@ -298,19 +298,12 @@ def test_extract_uses_asr_only_when_no_tracks(tmp_path):
     assert result["status"] == "ok"
 
 
-def test_extract_uses_asr_immediately_on_foreign_tracks(tmp_path):
+def test_extract_preserves_foreign_error_without_asr(tmp_path):
     from biliscribe.api import ForeignSubtitleError
 
-    class Engine:
-        model_id = "mock-paraformer"
-        device = "cpu"
-        def transcribe(self, *args, **kwargs):
-            return [Segment(1, 2, "串轨后转写")]
-
     class Source:
-        @contextmanager
         def open_audio(self, **kwargs):
-            yield tmp_path / "mock.wav"
+            raise AssertionError("归属冲突不得下载音频")
 
     class Client:
         def resolve(self, url): return url
@@ -321,13 +314,12 @@ def test_extract_uses_asr_immediately_on_foreign_tracks(tmp_path):
         def get_subtitle_list(self, *args, **kwargs):
             raise ForeignSubtitleError()
 
-    result = extract_one(Client(),
-        "https://www.bilibili.com/video/BV11gYd6UEPv/", ["txt"],
-        "all", ["zh"], tmp_path, lambda msg: None,
-        asr_engine=Engine(), audio_source=Source())
-    assert result["status"] == "ok"
-    assert result["subtitle_mismatch_pages"] == [1]
-    assert result["sources"] == ["asr"]
+    with pytest.raises(ForeignSubtitleError) as raised:
+        extract_one(Client(),
+            "https://www.bilibili.com/video/BV11gYd6UEPv/", ["txt"],
+            "all", ["zh"], tmp_path, lambda msg: None,
+            asr_engine=object(), audio_source=Source())
+    assert raised.value.reason == "ownership_conflict"
 
 
 def test_extract_asr_failure_is_recorded_per_page(tmp_path):

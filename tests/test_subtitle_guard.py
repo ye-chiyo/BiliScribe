@@ -21,6 +21,7 @@ CID = 41706587832
 BVID = "BV1V3Yn6wENr"
 ZH_GOOD = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/" + f"{AID}{CID}" + "e16daccabd23056845eff8887d2793e0?auth_key=aaa"
 ZH_BAD = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/11337329541521726472939880a6877ed40000000000000000000000?auth_key=bbb"
+EN_OWNED = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/" + f"{AID}{CID}" + "verified-en"
 EN_GOOD = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/3edf4c2f0f19b96ccd9259f653d571a7?auth_key=ccc"
 ZH_FOREIGN_OPAQUE = "//aisubtitle.hdslb.com/bfs/ai_subtitle/prod/160542018915680499092528a97cdc69a1be6c94eaf5e5021780?auth_key=ddd"
 
@@ -43,18 +44,18 @@ def encoded_v2_url(path, auth_key="test-signature", key_index=0):
 def test_track_owner_check():
     assert track_belongs_to_video(t(ZH_GOOD), AID, CID) is True
     assert track_belongs_to_video(t(ZH_BAD), AID, CID) is False
-    # 英文轨纯 hex 资源 id(归属段位置含字母), 无法校验时放行
-    assert track_belongs_to_video(t(EN_GOOD, "ai-en", "English"), AID, CID) is True
+    # Resource-only checks cannot authorize opaque IDs, regardless of language.
+    assert track_belongs_to_video(t(EN_GOOD, "ai-en", "English"), AID, CID) is False
     # 空 URL 拒绝
     assert track_belongs_to_video(t(""), AID, CID) is False
-    # 无 aid 无法校验, 放行(不应误杀)
-    assert track_belongs_to_video(t(ZH_BAD), None, CID) is True
+    # Missing identity is insufficient evidence, never a blanket permission.
+    assert track_belongs_to_video(t(ZH_BAD), None, CID) is False
     assert track_belongs_to_video(
         {**t(EN_GOOD, "ai-en", "English"), "author_mid": 999},
         AID, CID, owner_mid=123) is False
     assert track_belongs_to_video(
         {**t(EN_GOOD, "ai-en", "English"), "author_mid": 123},
-        AID, CID, owner_mid=123) is True
+        AID, CID, owner_mid=123) is False
     assert track_belongs_to_video(
         t(EN_GOOD, "ai-en", "English"), AID, CID, owner_mid=123) is False
 
@@ -68,8 +69,7 @@ def test_chinese_track_with_mismatched_numeric_prefix_is_rejected():
 
 class _Harness:
     def __init__(self, responses):
-        self.tmp = tempfile.TemporaryDirectory(
-            dir=Path(__file__).resolve().parent.parent / ".tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self._old_cache = api.CACHE_DIR
         api.CACHE_DIR = Path(self.tmp.name)
         self.client = BiliClient(setup_fingerprint=False)
@@ -100,10 +100,8 @@ def v2_data(*tracks):
     return {"subtitle": {"subtitles": list(tracks)}}
 
 
-def test_foreign_track_is_reported_immediately():
-    h = _Harness([
-        v2_data(t(ZH_BAD)),
-    ])
+def test_foreign_track_is_reported_after_bounded_retries():
+    h = _Harness([v2_data(t(ZH_BAD))] * 3)
     try:
         logs = []
         try:
@@ -112,12 +110,12 @@ def test_foreign_track_is_reported_immediately():
             pass
         else:
             raise AssertionError("串轨字幕必须触发专用异常")
-        assert len(h.calls) == 1
+        assert len(h.calls) == 3
         # 只允许 bvid 形式, 不得回退 aid 形式
         assert all("aid=" not in u for u in h.calls), h.calls
         assert all("_ts=" in u for u in h.calls), h.calls
         assert len({u.split("_ts=", 1)[1] for u in h.calls}) == len(h.calls), h.calls
-        assert any("其他视频" in m for m in logs)
+        assert any("不属于当前视频" in m for m in logs)
         # 串轨数据不得落盘
         cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
         cf = Path(h.tmp.name) / f"{cache_key}_list.json"
@@ -128,7 +126,7 @@ def test_foreign_track_is_reported_immediately():
 
 
 def test_all_rounds_bad_raises():
-    h = _Harness([v2_data(t(ZH_BAD))])
+    h = _Harness([v2_data(t(ZH_BAD))] * 3)
     try:
         raised = False
         try:
@@ -137,7 +135,7 @@ def test_all_rounds_bad_raises():
             raised = True
             assert "其他视频" in e.message
         assert raised
-        assert len(h.calls) == 1
+        assert len(h.calls) == 3
         # 全部失败时不得写缓存
         cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
         assert not (Path(h.tmp.name) / f"{cache_key}_list.json").exists()
@@ -147,14 +145,14 @@ def test_all_rounds_bad_raises():
 
 
 def test_dirty_cache_discarded():
-    h = _Harness([v2_data(t(ZH_GOOD), t(EN_GOOD, "ai-en", "English"))])
+    h = _Harness([v2_data(t(ZH_GOOD), t(EN_OWNED, "ai-en", "English"))])
     try:
         # 预置旧版本写入的脏缓存
         cache_key = hashlib.sha256(f"{BVID}:{AID}:{CID}".encode()).hexdigest()[:24]
         cf = Path(h.tmp.name) / f"{cache_key}_list.json"
         cf.write_text(json.dumps([t(ZH_BAD)]), encoding="utf-8")
         tracks = h.client.get_subtitle_list(BVID, AID, CID)
-        assert {x["subtitle_url"] for x in tracks} == {ZH_GOOD, EN_GOOD}
+        assert {x["subtitle_url"] for x in tracks} == {ZH_GOOD, EN_OWNED}
         assert len(h.calls) == 1  # 不信任脏缓存, 重新请求
     finally:
         h.close()
@@ -164,7 +162,7 @@ def test_dirty_cache_discarded():
 def test_empty_then_success():
     h = _Harness([
         v2_data(),                                              # 限流空列表
-        v2_data(t(ZH_GOOD), t(EN_GOOD, "ai-en", "English")),    # 退避后成功
+        v2_data(t(ZH_GOOD), t(EN_OWNED, "ai-en", "English")),    # 退避后成功
     ])
     try:
         tracks = h.client.get_subtitle_list(BVID, AID, CID)
@@ -270,20 +268,20 @@ def test_unknown_encoded_subtitle_url_is_rejected():
     else:
         raise AssertionError("未知编码字幕地址不得直接请求")
     print("[PASS] 未知编码字幕地址被拒绝")
-def test_foreign_track_routes_to_asr_immediately():
-    """确认串轨后立即转 ASR，不等待空字幕或继续导出。"""
-    h = _Harness([v2_data(t(ZH_BAD))])
+def test_foreign_track_remains_validation_error():
+    """确认串轨后保留专用异常，不当作空字幕或继续导出。"""
+    h = _Harness([v2_data(t(ZH_BAD))] * 3)
     try:
         try:
             h.client.get_subtitle_list(BVID, AID, CID)
         except ForeignSubtitleError:
             pass
         else:
-            raise AssertionError("串轨字幕必须触发本地 ASR 路由")
-        assert len(h.calls) == 1
+            raise AssertionError("串轨字幕必须保留归属冲突异常")
+        assert len(h.calls) == 3
     finally:
         h.close()
-    print("[PASS] 确认串轨后立即转入本地 ASR")
+    print("[PASS] 确认串轨后保留归属冲突异常")
 
 
 def test_all_rounds_empty_is_no_subtitle():
@@ -403,7 +401,7 @@ def test_stale_empty_body_cache_is_discarded():
 
 if __name__ == "__main__":
     test_track_owner_check()
-    test_foreign_track_is_reported_immediately()
+    test_foreign_track_is_reported_after_bounded_retries()
     test_all_rounds_bad_raises()
     test_dirty_cache_discarded()
     test_empty_then_success()
@@ -411,7 +409,7 @@ if __name__ == "__main__":
     test_encoded_subtitle_url_is_decoded_before_download()
     test_second_rotating_subtitle_key_matches_player_sample()
     test_unknown_encoded_subtitle_url_is_rejected()
-    test_foreign_track_routes_to_asr_immediately()
+    test_foreign_track_remains_validation_error()
     test_all_rounds_empty_is_no_subtitle()
     test_no_bvid_raises()
     test_body_cache_key_is_stable_rid()

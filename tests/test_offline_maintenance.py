@@ -36,8 +36,7 @@ class FakeResponse:
 
 class OfflineMaintenanceTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(
-            dir=Path(__file__).resolve().parent.parent / ".tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.old_cache = api.CACHE_DIR
         api.CACHE_DIR = Path(self.tmp.name)
         self.client = BiliClient(setup_fingerprint=False)
